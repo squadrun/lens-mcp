@@ -256,6 +256,7 @@ async def get_call_details(call_sid: str, ctx: Context, include_config: bool = F
         call_sid: The call SID (e.g. "abc123def456").
         include_config: Include the full agent config JSON (default False). Set True only when investigating config.
     """
+    call_sid = _sanitize_sid(call_sid)
     params = {}
     if not include_config:
         params["include_config"] = "false"
@@ -277,6 +278,7 @@ async def get_call_transcript(call_sid: str, ctx: Context) -> str:
     Args:
         call_sid: The call SID.
     """
+    call_sid = _sanitize_sid(call_sid)
     return _fmt(await _get(ctx, f"/call/{call_sid}/transcript"))
 
 
@@ -296,6 +298,7 @@ async def get_call_spans(call_sid: str, ctx: Context, node: str = "", phase: str
         node: Filter by node PREFIX (e.g. "llm" matches all LLM spans; "stt" matches all STT spans). Always use this for targeted lookups.
         phase: Filter by phase (e.g. "error", "ttfb", "complete"). Useful for quick error checks.
     """
+    call_sid = _sanitize_sid(call_sid)
     params: dict = {}
     if node:
         params["node"] = node
@@ -342,6 +345,7 @@ async def get_call_trace_logs(
         level: Level filter (mostly useless — trace logs are all info).
         limit: Max log lines (default 50, max 5000).
     """
+    call_sid = _sanitize_sid(call_sid)
     params: dict = {"limit": min(limit, 5000)}
     if search:
         params["search"] = search
@@ -362,6 +366,7 @@ async def get_call_entities(call_sid: str, ctx: Context) -> str:
     Args:
         call_sid: The call SID.
     """
+    call_sid = _sanitize_sid(call_sid)
     return _fmt(await _get(ctx, f"/call/{call_sid}/entities"))
 
 
@@ -375,6 +380,7 @@ async def get_call_context(call_sid: str, ctx: Context) -> str:
     Args:
         call_sid: The call SID.
     """
+    call_sid = _sanitize_sid(call_sid)
     return _fmt(await _get(ctx, f"/call/{call_sid}/context"))
 
 
@@ -395,6 +401,7 @@ async def get_lead_details(call_sid: str, ctx: Context) -> str:
     Args:
         call_sid: The call SID.
     """
+    call_sid = _sanitize_sid(call_sid)
     return _fmt(await _get(ctx, f"/call/{call_sid}/lead-details"))
 
 
@@ -700,7 +707,8 @@ async def compare_calls(call_sids: str, ctx: Context) -> str:
     Args:
         call_sids: Comma-separated call SIDs (e.g. "abc123,def456,ghi789").
     """
-    return _fmt(await _get(ctx, "/compare", params={"call_ids": call_sids}))
+    sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
+    return _fmt(await _get(ctx, "/compare", params={"call_ids": ",".join(sids)}))
 
 
 @mcp.tool()
@@ -716,6 +724,8 @@ async def compare_prompts(
         call_sid_a: First call SID.
         call_sid_b: Second call SID.
     """
+    call_sid_a = _sanitize_sid(call_sid_a)
+    call_sid_b = _sanitize_sid(call_sid_b)
     return _fmt(await _get(
         ctx, "/compare/prompt-diff",
         params={"call_id_a": call_sid_a, "call_id_b": call_sid_b},
