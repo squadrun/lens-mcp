@@ -736,23 +736,41 @@ async def _run_auth():
     """Interactive auth — run once to authenticate with Google."""
     if not BASE_URL:
         print("Error: LENS_BASE_URL is required.")
-        return
+        return False
     if not GOOGLE_CLIENT_ID:
         print("Error: LENS_GOOGLE_CLIENT_ID is required.")
-        return
+        return False
 
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT) as client:
         result = await _device_flow_auth(client)
         if result:
             print("Authentication successful. You can now use Lens MCP.")
+            return True
         else:
             print("Authentication failed.")
+            return False
+
+
+async def _ensure_auth_before_serve():
+    cached = _load_cached_token()
+    if cached and _is_token_valid(cached):
+        return True
+    if API_KEY:
+        return True
+    print("No valid token found. Starting authentication...\n")
+    return await _run_auth()
 
 
 def main():
     import sys as _sys
     if len(_sys.argv) > 1 and _sys.argv[1] == "auth":
         asyncio.run(_run_auth())
+    elif len(_sys.argv) > 1 and _sys.argv[1] == "serve":
+        if not asyncio.run(_ensure_auth_before_serve()):
+            return
+        port = int(_sys.argv[2]) if len(_sys.argv) > 2 else 8000
+        mcp.settings.port = port
+        mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")
 
