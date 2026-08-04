@@ -248,6 +248,8 @@ async def get_call_details(call_sid: str, ctx: Context, include_config: bool = F
 
     The config (agent_config_json) is large (~10K tokens). Set include_config=True
     only when you need the agent config. Default is False to save tokens.
+    Note the config holds the prompt TEMPLATE — for the rendered prompt actually
+    sent to the LLM, use get_call_prompt instead.
 
     For deep investigation after this, ALWAYS use download_trace_logs to download
     raw logs locally, then grep with Bash. Never use get_call_trace_logs.
@@ -280,6 +282,85 @@ async def get_call_transcript(call_sid: str, ctx: Context) -> str:
     """
     call_sid = _sanitize_sid(call_sid)
     return _fmt(await _get(ctx, f"/call/{call_sid}/transcript"))
+
+
+@mcp.tool()
+async def get_call_prompt(call_sids: str, ctx: Context) -> str:
+    """Get the rendered (interpolated) system prompt used for one or more calls.
+
+    This is the actual final prompt sent to the LLM — lead details and custom
+    variables already substituted in. Not the same as the prompt template in
+    get_call_details(include_config=True), which is the uninterpolated config.
+
+    Returns prompt_reference_id, prompt_hash, and prompt_text per call.
+    Prompts are retained for 30 days.
+
+    Prompts are large (often several thousand tokens each). Request only the
+    SIDs you actually need — do not pass a long list to browse.
+    To see what changed between two calls, use compare_prompts instead.
+
+    Args:
+        call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456").
+    """
+    sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
+    if not sids:
+        raise ValueError("No call SIDs provided")
+
+    async def fetch(sid: str) -> dict:
+        try:
+            return await _get(ctx, f"/call/{sid}/prompt")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"call_id": sid, "error": "Prompt not found (older than 30d retention?)"}
+            return {"call_id": sid, "error": f"HTTP {e.response.status_code}"}
+        except Exception as e:
+            # Isolate per SID: a timeout on one call must not fail the whole batch.
+            return {"call_id": sid, "error": f"{type(e).__name__}: {e}"}
+
+    results = await asyncio.gather(*(fetch(s) for s in sids))
+    return _fmt(results[0] if len(results) == 1 else {"prompts": list(results)})
+
+
+@mcp.tool()
+async def get_entity_prompt(call_sids: str, ctx: Context) -> str:
+    """Get the rendered entity-extraction prompt (system + user) for one or more calls.
+
+    This is the extraction-side counterpart to get_call_prompt:
+    - get_call_prompt   → the live-call agent prompt (what the bot said on the call)
+    - get_entity_prompt → the post-call extraction prompt (how outcomes/entities
+      were derived from the transcript)
+
+    Returns the processor variant, campaign_id, voice_mission_id,
+    entity_config_ref_id, lead_details, system_prompt and user_prompt.
+
+    Retention is 7 days — shorter than the 30 days for get_call_prompt. Older
+    calls return an error entry, not a prompt.
+
+    Prompts are large (~10K chars each). Request only the SIDs you need.
+
+    Args:
+        call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456").
+    """
+    sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
+    if not sids:
+        raise ValueError("No call SIDs provided")
+
+    async def fetch(sid: str) -> dict:
+        try:
+            return await _get(ctx, f"/call/{sid}/entity-prompt")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {
+                    "call_id": sid,
+                    "error": "Entity prompt not found (no extraction run, or older than 7d retention)",
+                }
+            return {"call_id": sid, "error": f"HTTP {e.response.status_code}"}
+        except Exception as e:
+            # Isolate per SID: a timeout on one call must not fail the whole batch.
+            return {"call_id": sid, "error": f"{type(e).__name__}: {e}"}
+
+    results = await asyncio.gather(*(fetch(s) for s in sids))
+    return _fmt(results[0] if len(results) == 1 else {"prompts": list(results)})
 
 
 @mcp.tool()
@@ -408,39 +489,22 @@ async def get_lead_details(call_sid: str, ctx: Context) -> str:
 # ── Trace log download (for multi-grep in Claude Code) ─────────────────
 
 
-@mcp.tool()
-async def download_trace_logs(call_sids: str, ctx: Context) -> str:
-    """Download trace logs for one or more calls to local files, then grep locally.
+async def _download_logs(
+    ctx: Context, call_sids: str, endpoint: str, file_suffix: str, label: str
+) -> str:
+    """Page a trace-log endpoint to one local file per call, then report paths.
 
-    This is the ONLY correct way to search trace logs. Downloads once per call,
-    then grep locally with Bash — unlimited searches, zero extra tokens,
-    case-insensitive, no ClickHouse round-trips.
-
-    When investigating multiple calls, pass ALL call SIDs at once to download
-    them all upfront. Do not download one and query the API for the rest.
-
-    Workflow:
-    1. Call this tool ONCE with all call_sids you need (comma-separated)
-    2. grep the local files with Bash — file paths are in the response
-    3. Run as many greps as needed — each is free (no API calls, no tokens)
-
-    Example grep commands after download:
-        grep -i "vad" /path/to/file.log              # VAD events
-        grep -i "stt" /path/to/file.log                 # STT events
-        grep -i "aggregation" /path/to/file.log       # turn aggregation
-        grep "03:49:3" /path/to/file.log              # filter by timestamp
-        grep -i "error\\|timeout" /path/to/file.log    # errors
-        grep -c "openai" /path/to/file.log            # count matches
-
-    Args:
-        call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456,ghi789").
+    Shared by download_trace_logs (live-call pipeline) and download_entity_logs
+    (post-call extraction worker); they differ only in endpoint and filename.
+    Writes via a 0600 temp file + rename so a partial download is never left
+    behind under the final path.
     """
     scratchpad = os.environ.get("CLAUDE_SCRATCHPAD_DIR", tempfile.gettempdir())
     sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
     results = []
 
     for sid in sids:
-        filepath = os.path.join(scratchpad, f"{sid}_traces.log")
+        filepath = os.path.join(scratchpad, f"{sid}_{file_suffix}.log")
 
         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
             line_count = sum(1 for _ in open(filepath))
@@ -456,7 +520,9 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
             with os.fdopen(fd, "w") as f:
                 offset = 0
                 for _ in range(max_batches):
-                    data = await _get(ctx, f"/call/{sid}/traces", params={"limit": batch_size, "offset": offset})
+                    data = await _get(
+                        ctx, f"/call/{sid}/{endpoint}", params={"limit": batch_size, "offset": offset}
+                    )
                     traces = data.get("traces", [])
                     if not traces:
                         break
@@ -480,10 +546,74 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
 
     summary = "\n".join(results)
     return (
-        f"Downloaded trace logs:\n{summary}\n\n"
+        f"Downloaded {label}:\n{summary}\n\n"
         f"All logs are now local. Use Bash grep for any further searching — "
-        f"no need to call the trace logs API again for these calls."
+        f"no need to call the {label} API again for these calls."
     )
+
+
+@mcp.tool()
+async def download_entity_logs(call_sids: str, ctx: Context) -> str:
+    """Download entity-extraction worker logs for one or more calls, then grep locally.
+
+    The extraction-side counterpart to download_trace_logs. These are DIFFERENT
+    log streams:
+    - download_trace_logs  → the live-call pipeline (STT/LLM/TTS/VAD). 4-day retention.
+    - download_entity_logs → the post-call async worker (transcript fetch, lead
+      details, extraction, posting results). 7-day retention.
+
+    Use this one for anything about entity extraction, call outcomes, or the
+    extraction prompt. Calls with no extraction run produce an empty file (0 lines).
+
+    Same workflow as download_trace_logs: call ONCE with all SIDs, then grep the
+    local files with Bash — each grep is free.
+
+    Example greps after download:
+        grep -i "entity extraction prompt" /path/to/file.log   # the rendered prompt
+        grep -i "model" /path/to/file.log                      # which model/provider ran
+        grep -i "fallback" /path/to/file.log                   # model routing / fallbacks
+        grep -i "outcome\\|answers" /path/to/file.log            # extracted entities
+        grep -i "error\\|timeout\\|failed" /path/to/file.log      # failures
+
+    For just the prompt, prefer get_entity_prompt — it returns it parsed.
+
+    Args:
+        call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456").
+    """
+    return await _download_logs(ctx, call_sids, "ee-traces", "ee_traces", "entity extraction logs")
+
+
+@mcp.tool()
+async def download_trace_logs(call_sids: str, ctx: Context) -> str:
+    """Download trace logs for one or more calls to local files, then grep locally.
+
+    This is the ONLY correct way to search trace logs. Downloads once per call,
+    then grep locally with Bash — unlimited searches, zero extra tokens,
+    case-insensitive, no ClickHouse round-trips.
+
+    Covers the LIVE-CALL pipeline only (STT/LLM/TTS/VAD). For the post-call
+    entity-extraction worker, use download_entity_logs instead.
+
+    When investigating multiple calls, pass ALL call SIDs at once to download
+    them all upfront. Do not download one and query the API for the rest.
+
+    Workflow:
+    1. Call this tool ONCE with all call_sids you need (comma-separated)
+    2. grep the local files with Bash — file paths are in the response
+    3. Run as many greps as needed — each is free (no API calls, no tokens)
+
+    Example grep commands after download:
+        grep -i "vad" /path/to/file.log              # VAD events
+        grep -i "stt" /path/to/file.log                 # STT events
+        grep -i "aggregation" /path/to/file.log       # turn aggregation
+        grep "03:49:3" /path/to/file.log              # filter by timestamp
+        grep -i "error\\|timeout" /path/to/file.log    # errors
+        grep -c "openai" /path/to/file.log            # count matches
+
+    Args:
+        call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456,ghi789").
+    """
+    return await _download_logs(ctx, call_sids, "traces", "traces", "trace logs")
 
 
 # ── Structured search (fast, uses indexed columns) ────────────────────
@@ -718,7 +848,8 @@ async def compare_prompts(
     """Diff the system prompts used in two calls.
 
     Returns a unified diff showing exactly what changed between the prompts.
-    Useful for investigating behavior differences between calls.
+    Useful for investigating behavior differences between calls. To read a
+    prompt in full rather than diff it, use get_call_prompt.
 
     Args:
         call_sid_a: First call SID.
