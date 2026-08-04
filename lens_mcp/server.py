@@ -707,9 +707,11 @@ async def search_spans(
 async def list_calls(
     ctx: Context,
     campaign_id: str = "",
+    voice_mission_id: str = "",
     agent_config_id: str = "",
     customer: str = "",
     status: str = "",
+    ee_status: str = "",
     stt_provider: str = "",
     llm_model: str = "",
     tts_provider: str = "",
@@ -729,9 +731,13 @@ async def list_calls(
 
     Args:
         campaign_id: Filter by campaign.
+        voice_mission_id: Filter by voice mission (a campaign contains many).
         agent_config_id: Filter by agent config ID.
         customer: Filter by customer/tenant.
         status: Filter by call status (e.g. "completed").
+        ee_status: Filter by entity-extraction status (e.g. "success"). Use this
+            when you need a call that actually ran extraction — e.g. before
+            calling get_entity_prompt, which has nothing to return otherwise.
         stt_provider: Filter by STT provider.
         llm_model: Filter by LLM model.
         tts_provider: Filter by TTS provider.
@@ -744,12 +750,16 @@ async def list_calls(
     params: dict = {"limit": min(limit, 100)}
     if campaign_id:
         params["campaign_id"] = campaign_id
+    if voice_mission_id:
+        params["voice_mission_id"] = voice_mission_id
     if agent_config_id:
         params["agent_config_id"] = agent_config_id
     if customer:
         params["customer"] = customer
     if status:
         params["status"] = status
+    if ee_status:
+        params["ee_status"] = ee_status
     if stt_provider:
         params["stt_provider"] = stt_provider
     if llm_model:
