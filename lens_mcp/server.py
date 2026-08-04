@@ -616,6 +616,97 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
     return await _download_logs(ctx, call_sids, "traces", "traces", "trace logs")
 
 
+def _write_private(path: str, text: str) -> int:
+    """Write text via a 0600 temp file + rename, so a partial write is never
+    visible under the final path. Returns the character count."""
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.rename(path + ".tmp", path)
+    return len(text)
+
+
+async def _get_or_none(ctx: Context, path: str) -> dict | None:
+    """GET that treats 404 as absence rather than failure — a call can have one
+    prompt without the other (e.g. extraction never ran, or the 7-day
+    ee_trace_logs window has passed while the 30-day agent prompt survives)."""
+    try:
+        return await _get(ctx, path)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return None
+        raise
+
+
+@mcp.tool()
+async def download_prompts(call_sids: str, ctx: Context) -> str:
+    """Download the agent prompt and entity prompt for one or more calls to local files.
+
+    PREFER THIS over get_call_prompt / get_entity_prompt when you want the prompt
+    text itself. Prompts run 30–60 KB each, which overflows an inline tool
+    response — the content then has to be paged back out of a spill file as
+    double-encoded JSON. This writes plain .txt instead: readable, greppable, and
+    directly shareable with someone else.
+
+    Same idea as download_trace_logs, applied to prompts.
+
+    Writes up to three files per call:
+        <sid>_agent_prompt.txt          the live-call agent prompt (30-day retention)
+        <sid>_entity_prompt_system.txt  the extraction instructions (7-day retention)
+        <sid>_entity_prompt_user.txt    the transcript the extractor was given
+
+    A call missing either prompt is reported, not failed — the two have different
+    retention windows and extraction may never have run.
+
+    Still use get_entity_prompt when you want the parsed metadata inline
+    (variant, campaign_id, entity_config_ref_id, lead_details) rather than the
+    prompt bodies; that response is small enough to return directly.
+
+    Args:
+        call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456").
+    """
+    scratchpad = os.environ.get("CLAUDE_SCRATCHPAD_DIR", tempfile.gettempdir())
+    sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
+    if not sids:
+        raise ValueError("No call SIDs provided")
+
+    results: list[str] = []
+    for sid in sids:
+        try:
+            agent = await _get_or_none(ctx, f"/call/{sid}/prompt")
+            entity = await _get_or_none(ctx, f"/call/{sid}/entity-prompt")
+        except Exception as e:
+            results.append(f"{sid}: FAILED ({type(e).__name__}: {e})")
+            continue
+
+        written: list[str] = []
+        if agent and agent.get("prompt_text"):
+            p = os.path.join(scratchpad, f"{sid}_agent_prompt.txt")
+            n = _write_private(p, agent["prompt_text"])
+            ref = agent.get("prompt_reference_id") or "?"
+            written.append(f"    agent prompt  ({n:,} chars, ref {ref}) -> {p}")
+        else:
+            written.append("    agent prompt  NOT FOUND (older than 30d retention?)")
+
+        if entity and entity.get("system_prompt"):
+            p = os.path.join(scratchpad, f"{sid}_entity_prompt_system.txt")
+            n = _write_private(p, entity["system_prompt"])
+            variant = entity.get("variant") or "base"
+            written.append(f"    entity prompt ({n:,} chars, variant {variant}) -> {p}")
+            up = os.path.join(scratchpad, f"{sid}_entity_prompt_user.txt")
+            un = _write_private(up, entity.get("user_prompt") or "")
+            written.append(f"    extractor input ({un:,} chars) -> {up}")
+        else:
+            written.append("    entity prompt NOT FOUND (no extraction run, or older than 7d)")
+
+        results.append(f"{sid}:\n" + "\n".join(written))
+
+    return (
+        "Downloaded prompts:\n" + "\n".join(results) + "\n\n"
+        "Files are plain text. Read or grep them directly — no need to re-fetch."
+    )
+
+
 # ── Structured search (fast, uses indexed columns) ────────────────────
 
 
