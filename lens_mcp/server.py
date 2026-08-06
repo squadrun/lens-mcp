@@ -501,48 +501,53 @@ async def _download_logs(
     """
     scratchpad = os.environ.get("CLAUDE_SCRATCHPAD_DIR", tempfile.gettempdir())
     sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
-    results = []
 
-    for sid in sids:
+    await _ensure_auth(ctx)
+
+    sem = asyncio.Semaphore(10)
+
+    async def _download_one(sid: str) -> str:
         filepath = os.path.join(scratchpad, f"{sid}_{file_suffix}.log")
 
         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
             line_count = sum(1 for _ in open(filepath))
-            results.append(f"{sid}: already downloaded ({line_count} lines) -> {filepath}")
-            continue
+            return f"{sid}: already downloaded ({line_count} lines) -> {filepath}"
 
         total_lines = 0
         batch_size = 5000
         max_batches = 10
 
         try:
-            fd = os.open(filepath + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                offset = 0
-                for _ in range(max_batches):
-                    data = await _get(
-                        ctx, f"/call/{sid}/{endpoint}", params={"limit": batch_size, "offset": offset}
-                    )
-                    traces = data.get("traces", [])
-                    if not traces:
-                        break
-                    for row in traces:
-                        ts = row.get("timestamp_ms", "")
-                        lvl = row.get("level", "info")
-                        logger = row.get("logger_name", "")
-                        msg = row.get("message", "").replace("\n", "\\n")
-                        f.write(f"{ts} {lvl.upper():7s} [{logger}] {msg}\n")
-                        total_lines += 1
-                    if len(traces) < batch_size:
-                        break
-                    offset += batch_size
-            os.rename(filepath + ".tmp", filepath)
-            results.append(f"{sid}: {total_lines} lines -> {filepath}")
+            async with sem:
+                fd = os.open(filepath + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    offset = 0
+                    for _ in range(max_batches):
+                        data = await _get(
+                            ctx, f"/call/{sid}/{endpoint}", params={"limit": batch_size, "offset": offset}
+                        )
+                        traces = data.get("traces", [])
+                        if not traces:
+                            break
+                        for row in traces:
+                            ts = row.get("timestamp_ms", "")
+                            lvl = row.get("level", "info")
+                            logger = row.get("logger_name", "")
+                            msg = row.get("message", "").replace("\n", "\\n")
+                            f.write(f"{ts} {lvl.upper():7s} [{logger}] {msg}\n")
+                            total_lines += 1
+                        if len(traces) < batch_size:
+                            break
+                        offset += batch_size
+                os.rename(filepath + ".tmp", filepath)
+            return f"{sid}: {total_lines} lines -> {filepath}"
         except Exception as e:
             for p in (filepath + ".tmp", filepath):
                 if os.path.exists(p):
                     os.remove(p)
-            results.append(f"{sid}: FAILED ({e})")
+            return f"{sid}: FAILED ({e})"
+
+    results = await asyncio.gather(*[_download_one(sid) for sid in sids])
 
     summary = "\n".join(results)
     return (
