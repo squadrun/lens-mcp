@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lens_mcp.server import (  # noqa: E402
     _aggregate,
+    _filters_dropped_by_server,
     _grouper,
     _metric_value,
     _parse_metric,
@@ -151,6 +152,44 @@ def test_aggregate_on_metadata_metric_drops_the_ms_suffix():
     assert "p50_ms" not in out["overall"]  # tokens are not milliseconds
     assert out["trend"]["delta_pct"] > 0  # context is growing
     assert [g["group"] for g in out["groups"]][:2] == ["turn 0", "turn 1"]
+
+
+def _resp(*matches):
+    return {"calls": [{"matches": list(matches)}]}
+
+
+def test_detects_a_filter_the_backend_dropped():
+    # A lens older than #55 returns ttfb rows regardless of what you asked for.
+    resp = _resp({"phase": "ttfb", "event_name": "llm.request"})
+
+    assert _filters_dropped_by_server(resp, phase="complete") == ["phase='complete'"]
+    assert _filters_dropped_by_server(resp, event_name="llm.usage") == ["event_name='llm.usage'"]
+    assert _filters_dropped_by_server(resp, phase="complete", event_name="llm.usage") == [
+        "phase='complete'",
+        "event_name='llm.usage'",
+    ]
+
+
+def test_stays_quiet_when_the_filter_held():
+    resp = _resp({"phase": "ttfb"}, {"phase": "ttfb"})
+
+    assert _filters_dropped_by_server(resp, phase="ttfb") == []
+    assert _filters_dropped_by_server(resp) == []  # nothing filtered, nothing to check
+
+
+def test_a_single_matching_row_is_enough_to_stay_quiet():
+    # One-sided by design: a mixed page means the filter ran on at least that value,
+    # so we do not cry wolf. Only a total absence of matches is evidence.
+    resp = _resp({"phase": "ttfb"}, {"phase": "complete"})
+
+    assert _filters_dropped_by_server(resp, phase="complete") == []
+
+
+def test_empty_result_is_not_evidence_either_way():
+    # Zero rows is a legitimate "no such span" — never flag it as a dropped filter.
+    assert _filters_dropped_by_server({"calls": []}, phase="ttfb") == []
+    assert _filters_dropped_by_server({}, phase="ttfb") == []
+    assert _filters_dropped_by_server(_resp(), phase="ttfb") == []
 
 
 if __name__ == "__main__":

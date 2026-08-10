@@ -36,6 +36,11 @@ GOOGLE_CLIENT_ID = os.environ.get("LENS_GOOGLE_CLIENT_ID", "")
 API_PREFIX = "/api/ext/v1"
 TIMEOUT = 30.0
 
+try:
+    _VERSION = __import__("importlib.metadata", fromlist=["version"]).version("lens-mcp")
+except Exception:
+    _VERSION = "unknown"
+
 _SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
 _MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
 _COHORT_CONCURRENCY = 8
@@ -243,9 +248,13 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
 
 # Semantics the server-side schema does not carry, each of which has silently
 # produced a wrong answer: see squadrun/lens-mcp#1.
-_CLIENT_NOTES = """
+_CLIENT_NOTES = f"""
 
-## Client notes (lens-mcp) — read before computing any number
+## Client notes (lens-mcp {_VERSION}) — read before computing any number
+
+Installs are per-machine `git pull`s, so this version is the only reliable
+statement of which tools you have. If a tool named below is missing from your
+session, the install is stale — re-run the install command in the lens-mcp README.
 
 ### turn_number is a BOT-UTTERANCE counter, not a user-turn counter
 It is `session_state.bot_stopped_count` in squadstack-bot, incremented on every
@@ -254,19 +263,20 @@ Two calls at the same turn_number are NOT at equal conversational depth — do n
 use it to align calls when comparing them.
 
 ### metadata_filter needs a node scope
-Unscoped, it silently returns 0 hits: `metadata_filter=transport:sse` alone
-matches nothing, while the same filter with `node=llm.openai` matches. search_spans
-rejects the unscoped form rather than returning a misleading empty result.
+metadata is unindexed, so filtering it across a whole time window would scan every
+span; the server requires a narrowing filter alongside it and search_spans checks
+for one before making the request. Before lens#55 the unscoped form returned 0 hits
+instead of an error, which is why older notes claim it "fails for transport".
 Values match exactly and case-sensitively against the raw JSON value —
 `model:gemma4` hits; `model:gemma` and `model:GEMMA4` do not. Numbers and bools
 match as written in the JSON (`prompt_tokens:26430`, `speech_final:true`).
 
-### /search ignores event_name and phase
-It accepts both and filters on neither — `phase=ttfb` and `phase=complete` return
-byte-identical rows. search_spans therefore does not expose them. count_spans DOES
-honour both. To filter spans by event_name or phase, work within a call
-(get_call_spans / aggregate_spans), where phase is applied server-side and
-event_name client-side.
+### event_name / phase on /search need lens#55
+Before that fix the backend accepted both and filtered on neither, returning
+unfiltered rows with a 200. search_spans now checks the rows it gets back and
+prefixes the response with FILTER_IGNORED if the backend is still dropping them —
+if you see that, the filter did not apply and the rows are not what you asked for.
+count_spans has always honoured both.
 
 ### node accepts a prefix
 `node=llm.`, `node=llm` and `node=llm.openai` all work, on both search_spans and
@@ -1345,11 +1355,34 @@ async def download_prompts(call_sids: str, ctx: Context) -> str:
 # ── Structured search (fast, uses indexed columns) ────────────────────
 
 
+def _filters_dropped_by_server(data: dict, **filters: str) -> list[str]:
+    """Name any filter the server accepted but did not apply.
+
+    /search ignored event_name and phase until squadrun/lens#55, returning
+    unfiltered rows with a 200. Client and backend deploy separately, so checking
+    the rows we got back is the only way to tell a fixed backend from an old one.
+
+    One-sided by construction: no row matching the filter proves it was dropped,
+    but every row matching proves nothing — an ignored filter still looks correct
+    when the unfiltered page happens to be uniform. Silence here is not a pass.
+    """
+    rows = [m for call in data.get("calls", []) for m in call.get("matches", [])]
+    if not rows:
+        return []
+    return [
+        f"{field}={value!r}"
+        for field, value in filters.items()
+        if value and all(row.get(field) != value for row in rows)
+    ]
+
+
 @mcp.tool()
 async def search_spans(
     ctx: Context,
     query: str = "",
     node: str = "",
+    event_name: str = "",
+    phase: str = "",
     level: str = "",
     value_ms_min: float = 0,
     value_ms_max: float = 0,
@@ -1375,32 +1408,28 @@ async def search_spans(
     When provided, query text is LIKE-matched against event_name, node,
     campaign_id, prompt_reference_id, call_id, error_message — this is slower.
 
-    THE SERVER DOES NOT FILTER BY event_name OR phase HERE. It accepts both and
-    ignores them: phase="ttfb" and phase="complete" return byte-identical rows.
-    They are deliberately not exposed on this tool. Use count_spans (which does
-    honour them) to count, or aggregate_spans/get_call_spans to filter within a
-    known call.
-
-    metadata_filter ONLY WORKS when scoped by node. Unscoped it returns zero hits
-    against spans that plainly contain the key — the empty result is
-    indistinguishable from "no data", so this tool rejects that combination
-    instead of returning it. Values match exactly and case-sensitively:
-    metadata_filter="model:gemma4" hits, "model:gemma" and "model:GEMMA4" do not.
-    Numbers and bools match as written in the JSON ("prompt_tokens:26430",
-    "speech_final:true").
-
-    Verified as actually filtering: node, level, campaign_id, value_ms_min/max,
-    and node-scoped metadata_filter.
+    metadata_filter requires a node scope. Unscoped it cannot be answered without
+    scanning every span, so the server rejects it — this tool checks first and
+    fails locally with the same guidance, saving the round trip. Values match
+    exactly and case-sensitively: metadata_filter="model:gemma4" hits,
+    "model:gemma" and "model:GEMMA4" do not. Numbers and bools match as written
+    in the JSON ("prompt_tokens:26430", "speech_final:true").
 
     Returns at most 100 spans per page (use offset via repeated calls). This is
     a row sampler, not a measurement tool — for percentiles across calls use
     aggregate_calls, which pages properly.
+
+    If a response comes back with FILTER_IGNORED, the lens backend predates
+    squadrun/lens#55 and is dropping event_name/phase server-side: the rows are
+    real spans but not the ones you asked for. Do not draw conclusions from them.
 
     For known node/event values, check the bot repo for the latest instrumentation.
 
     Args:
         query: Optional free-text search (LIKE match — expensive). Prefer structured filters instead.
         node: Node prefix filter (e.g. "llm.", "stt.", "tool."). Uses indexed SET column. "llm.", "llm" and "llm.openai" all work.
+        event_name: Exact event name filter (e.g. "llm.usage", "pipeline.cost_summary"). Indexed.
+        phase: Phase filter ("ttfb", "complete", "error", "timeout", "cancelled", "connect").
         level: Level filter — "info" or "error". Indexed.
         value_ms_min: Min duration in ms (find slow operations).
         value_ms_max: Max duration in ms.
@@ -1418,9 +1447,10 @@ async def search_spans(
     """
     if metadata_filter and not node:
         raise ValueError(
-            f"metadata_filter={metadata_filter!r} needs a node scope — unscoped it "
-            f"silently returns 0 hits even when spans carry that key. "
-            f"Retry with e.g. node='llm.openai'."
+            f"metadata_filter={metadata_filter!r} needs a node scope — metadata is "
+            f"unindexed, so filtering it across a whole time window would scan every "
+            f"span. The server rejects this too; failing here saves the round trip. "
+            f"Retry with e.g. node='llm.openai' or node='llm.'."
         )
 
     params: dict = {"limit": min(limit, 100)}
@@ -1428,6 +1458,10 @@ async def search_spans(
         params["q"] = query
     if node:
         params["node"] = node
+    if event_name:
+        params["event_name"] = event_name
+    if phase:
+        params["phase"] = phase
     if level:
         params["level"] = level
     if value_ms_min > 0:
@@ -1454,7 +1488,19 @@ async def search_spans(
         params["time_range_minutes"] = time_range_minutes
     if time_to:
         params["time_to"] = time_to
-    return _fmt(await _get(ctx, "/search", params=params))
+    data = await _get(ctx, "/search", params=params)
+    ignored = _filters_dropped_by_server(data, event_name=event_name, phase=phase)
+    if ignored:
+        data = {
+            "FILTER_IGNORED": (
+                f"This lens backend dropped {', '.join(ignored)} server-side — the rows below are "
+                f"real spans but NOT the ones you filtered for. Do not draw conclusions from them. "
+                f"Fixed by squadrun/lens#55; until it is deployed, use count_spans (which honours "
+                f"both) or filter within a call via aggregate_spans."
+            ),
+            **data,
+        }
+    return _fmt(data)
 
 
 @mcp.tool()
