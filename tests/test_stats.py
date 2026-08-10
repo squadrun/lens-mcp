@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lens_mcp.server import (  # noqa: E402
     _aggregate,
     _grouper,
+    _metric_value,
+    _parse_metric,
     _parse_percentiles,
     _parse_range,
     _percentile,
@@ -95,8 +97,8 @@ def test_aggregate_excludes_events_and_guards_mixed_node_trend():
 
     out = _aggregate(spans, [50], "turn_bucket:5")
     assert out["spans_matched"] == 10
-    assert out["spans_with_duration"] == 9
-    assert out["events_without_duration"] == 1
+    assert out["spans_measured"] == 9
+    assert out["spans_without_metric"] == 1
     assert out["overall"]["count"] == 9  # the event never reaches the statistics
     assert [g["group"] for g in out["groups"]] == ["turns 0-4", "turns 5-9"]
     assert isinstance(out["trend"], dict)
@@ -108,6 +110,47 @@ def test_aggregate_excludes_events_and_guards_mixed_node_trend():
     events_only = [{"node": "pipeline.call", "turn_number": 0, "value_ms": None}]
     out = _aggregate(events_only, [50], "")
     assert "overall" not in out and "note" in out
+
+
+def test_parse_metric_and_extraction():
+    assert _parse_metric("value_ms") == ("", "_ms")
+    assert _parse_metric("") == ("", "_ms")
+    assert _parse_metric("metadata:prompt_tokens") == ("prompt_tokens", "")
+    for bad in ("metadata:", "tokens", "metadata"):
+        try:
+            _parse_metric(bad)
+            raise AssertionError(f"expected {bad!r} to be rejected")
+        except ValueError:
+            pass
+
+    span = {"value_ms": 12.5, "metadata": '{"prompt_tokens": 26430, "model": "gemma4", "cache_hit": true}'}
+    assert _metric_value(span, "") == 12.5
+    assert _metric_value(span, "prompt_tokens") == 26430.0
+    assert _metric_value(span, "model") is None  # strings are not measurements
+    assert _metric_value(span, "cache_hit") is None  # bools are flags, not measurements
+    assert _metric_value(span, "absent") is None
+    assert _metric_value({"metadata": "not json"}, "prompt_tokens") is None
+    assert _metric_value({}, "") is None
+
+
+def test_aggregate_on_metadata_metric_drops_the_ms_suffix():
+    # llm.usage events carry tokens but no duration — they must still be measurable.
+    spans = [
+        {
+            "node": "llm.simplismart",
+            "turn_number": t,
+            "value_ms": None,
+            "metadata": f'{{"prompt_tokens": {26000 + t * 100}}}',
+        }
+        for t in range(9)
+    ]
+    out = _aggregate(spans, [50, 90], "turn", metric="metadata:prompt_tokens")
+    assert out["metric"] == "metadata:prompt_tokens"
+    assert out["spans_measured"] == 9
+    assert out["overall"]["p50"] == 26400.0
+    assert "p50_ms" not in out["overall"]  # tokens are not milliseconds
+    assert out["trend"]["delta_pct"] > 0  # context is growing
+    assert [g["group"] for g in out["groups"]][:2] == ["turn 0", "turn 1"]
 
 
 if __name__ == "__main__":
