@@ -228,8 +228,26 @@ async def _ensure_auth(ctx: Context) -> None:
     lc["authenticated"] = True
 
 
-_RETRY_STATUS = {502, 503, 504}
+# 429 (per-principal rate limit) and 503 (heavy-query concurrency shed) are load-shedding, not
+# broken queries — the server asks you to back off, so retry rather than surface an error. 502/504
+# are gateway blips. All are transient.
+_RETRY_STATUS = {429, 502, 503, 504}
+_LOAD_SHED_STATUS = {429, 503}
 _MAX_RETRIES = 2
+_MAX_RETRY_SLEEP = 15.0
+
+
+def _retry_sleep(resp: httpx.Response | None, attempt: int) -> float:
+    """Honour a Retry-After header when the server sends one (rate limit / capacity), else
+    exponential backoff. Capped so a hostile Retry-After can't wedge the tool."""
+    if resp is not None:
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return min(float(header), _MAX_RETRY_SLEEP)
+            except ValueError:
+                pass
+    return min(0.5 * 2**attempt, 8.0)
 
 
 async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
@@ -245,7 +263,7 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
             # cheaper than surfacing a 504 and making the caller redo the analysis.
             if attempt == _MAX_RETRIES:
                 raise
-            await asyncio.sleep(0.5 * 2**attempt)
+            await asyncio.sleep(_retry_sleep(None, attempt))
             continue
 
         if resp.status_code == 401:
@@ -253,9 +271,18 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
             _set_auth(client, await _authenticate(client))
             resp = await client.get(url, params=params)
 
-        if resp.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
-            await asyncio.sleep(0.5 * 2**attempt)
-            continue
+        if resp.status_code in _RETRY_STATUS:
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_retry_sleep(resp, attempt))
+                continue
+            if resp.status_code in _LOAD_SHED_STATUS:
+                # Exhausted retries on a deliberate shed — the query is fine, the server is busy
+                # or you are rate-limited. Say so, so the caller slows down instead of hammering.
+                raise RuntimeError(
+                    f"lens is shedding load (HTTP {resp.status_code}) after {_MAX_RETRIES + 1} "
+                    f"attempts — your query is fine, the server is at capacity or you are "
+                    f"rate-limited. Wait a moment and retry, or narrow the query."
+                )
 
         resp.raise_for_status()
         return resp.json()
