@@ -1408,6 +1408,11 @@ async def search_spans(
     campaign_id) over the query param — they use indexed columns and avoid
     expensive LIKE scans.
 
+    This searches SPAN COLUMNS, never log text. The query param LIKE-matches
+    event_name, node, campaign_id, prompt_reference_id, call_id and error_message
+    only — a phrase from a log line will not match here and returns an empty result
+    that looks like "no such calls". For log bodies use search_trace_logs.
+
     The query param is OPTIONAL. When you have exact filter values, omit it.
     When provided, query text is LIKE-matched against event_name, node,
     campaign_id, prompt_reference_id, call_id, error_message — this is slower.
@@ -2000,6 +2005,9 @@ async def list_filter_values(ctx: Context) -> str:
 
     A filter value absent from this list will return zero rows — which is
     indistinguishable from "the thing you asked about did not happen".
+
+    Feeds the filters on list_calls, search_spans, slowest_calls, latency_over_time
+    and latency_breakdown.
     """
     return _fmt(await _get(ctx, "/observability/filters"))
 
@@ -2019,7 +2027,11 @@ async def search_trace_logs(
     """Free-text search across raw log bodies for ALL calls — not one call at a time.
 
     This is the fleet-wide log grep. Use it to find which calls contain a log
-    line, then drill in with download_trace_logs. Previously this meant calling
+    line, then drill in with download_trace_logs.
+
+    Not to be confused with search_spans, which matches span columns and cannot see
+    log text at all. If you are looking for a phrase a service logged, it is this
+    tool. Previously this meant calling
     get_call_trace_logs once per call_sid, which needs the call list up front —
     exactly what you do not have when hunting an unknown failure.
 
