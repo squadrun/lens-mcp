@@ -3,6 +3,38 @@
 MCP server exposing the Lens ext API — call investigation, latency aggregation,
 and cross-call comparison as tools for Claude Code.
 
+## Tools
+
+Full argument docs live in each tool's docstring — that is what an agent reads. This is the
+map for humans.
+
+**Start here.** `get_schema` (tables, semantics, retention) · `list_filter_values` (the
+campaigns / models / providers you can actually filter on — check before guessing)
+
+**Fleet: what is happening across calls.** `latency_over_time` · `latency_breakdown` ·
+`event_counts_over_time` · `error_counts_over_time` · `tool_outcomes` · `slowest_calls` ·
+`get_extraction_stats` · `list_calls` · `search_spans` · `count_spans`
+
+**One call: what happened in it.** `get_call_details` · `get_call_spans` · `aggregate_spans` ·
+`get_call_transcript` · `get_call_entities` · `get_call_context` · `get_lead_details` ·
+`get_call_config` · `get_call_prompt` · `get_entity_prompt`
+
+**Logs.** `search_trace_logs` (find which calls contain a line) → `download_trace_logs` /
+`download_entity_logs` (pull them local, then grep) · `get_call_trace_logs` (targeted
+server-side)
+
+**Compare.** `compare_calls` · `compare_prompts` · `aggregate_calls` · `download_prompts`
+
+Two rules the tools enforce rather than merely document:
+
+- **Never compute a percentile from rows.** `get_call_spans` caps at 500 per page and
+  `search_spans` at 100, so a statistic from one response is wrong on anything busy. Use
+  `aggregate_spans` (one call), `slowest_calls` (a cohort) or `latency_breakdown` (the fleet).
+  Row responses carry a loud `TRUNCATED` notice when they are a partial view.
+- **Retention differs by source, and responses say which.** Aggregate views 90 days ·
+  spans 30 · prompts/configs 30 · extraction logs 7 · trace logs 4. An empty result on an old
+  call usually means the evidence aged out, not that nothing happened.
+
 ## Install / update
 
 There is no package registry and no auto-update: each machine runs whatever commit

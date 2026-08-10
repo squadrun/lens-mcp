@@ -44,6 +44,26 @@ except Exception:
 _SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
 _MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
 _COHORT_CONCURRENCY = 8
+# A fleet-wide trace-log scan and a sort on a non-indexed span column both read/sort the whole
+# matched set. Safe over a short window; unbounded they pressure the box. Cap the window to 2h
+# unless a high-selectivity filter (campaign_id/agent_config_id/prompt_ref) narrows first.
+_UNSCOPED_WINDOW_CAP_MIN = 120
+_HIGH_SELECTIVITY = ("campaign_id", "agent_config_id", "prompt_ref")
+
+
+def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> float | None:
+    """Effective look-back window in minutes; None if an explicit window can't be parsed
+    (treated as unbounded so an unparseable time_from cannot slip past a cap)."""
+    if time_range_minutes and time_range_minutes > 0:
+        return float(time_range_minutes)
+    if time_from:
+        try:
+            start = datetime.fromisoformat(time_from)
+            end = datetime.fromisoformat(time_to) if time_to else datetime.now(start.tzinfo)
+            return (end - start).total_seconds() / 60
+        except (ValueError, TypeError):
+            return None
+    return 60.0
 
 _CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
 
@@ -208,8 +228,26 @@ async def _ensure_auth(ctx: Context) -> None:
     lc["authenticated"] = True
 
 
-_RETRY_STATUS = {502, 503, 504}
+# 429 (per-principal rate limit) and 503 (heavy-query concurrency shed) are load-shedding, not
+# broken queries — the server asks you to back off, so retry rather than surface an error. 502/504
+# are gateway blips. All are transient.
+_RETRY_STATUS = {429, 502, 503, 504}
+_LOAD_SHED_STATUS = {429, 503}
 _MAX_RETRIES = 2
+_MAX_RETRY_SLEEP = 15.0
+
+
+def _retry_sleep(resp: httpx.Response | None, attempt: int) -> float:
+    """Honour a Retry-After header when the server sends one (rate limit / capacity), else
+    exponential backoff. Capped so a hostile Retry-After can't wedge the tool."""
+    if resp is not None:
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return min(float(header), _MAX_RETRY_SLEEP)
+            except ValueError:
+                pass
+    return min(0.5 * 2**attempt, 8.0)
 
 
 async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
@@ -225,7 +263,7 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
             # cheaper than surfacing a 504 and making the caller redo the analysis.
             if attempt == _MAX_RETRIES:
                 raise
-            await asyncio.sleep(0.5 * 2**attempt)
+            await asyncio.sleep(_retry_sleep(None, attempt))
             continue
 
         if resp.status_code == 401:
@@ -233,9 +271,18 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
             _set_auth(client, await _authenticate(client))
             resp = await client.get(url, params=params)
 
-        if resp.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
-            await asyncio.sleep(0.5 * 2**attempt)
-            continue
+        if resp.status_code in _RETRY_STATUS:
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_retry_sleep(resp, attempt))
+                continue
+            if resp.status_code in _LOAD_SHED_STATUS:
+                # Exhausted retries on a deliberate shed — the query is fine, the server is busy
+                # or you are rate-limited. Say so, so the caller slows down instead of hammering.
+                raise RuntimeError(
+                    f"lens is shedding load (HTTP {resp.status_code}) after {_MAX_RETRIES + 1} "
+                    f"attempts — your query is fine, the server is at capacity or you are "
+                    f"rate-limited. Wait a moment and retry, or narrow the query."
+                )
 
         resp.raise_for_status()
         return resp.json()
@@ -900,6 +947,10 @@ async def aggregate_calls(
     raising max_calls — this samples the most recent N calls matching the filters,
     it is not a full-population query.
 
+    For a whole-population ranking in a single query, use slowest_calls instead.
+    Stay here when you want per-call metadata (llm_model, duration) beside the
+    numbers, or when the backend predates the call-percentiles endpoint.
+
     Args:
         node: Node prefix to measure (e.g. "llm", "stt.<provider>", "tts"). Required — an unfiltered cohort percentile mixes unrelated operations and means nothing.
         phase: Phase filter ("ttfb", "complete", "error").
@@ -1404,6 +1455,11 @@ async def search_spans(
     campaign_id) over the query param — they use indexed columns and avoid
     expensive LIKE scans.
 
+    This searches SPAN COLUMNS, never log text. The query param LIKE-matches
+    event_name, node, campaign_id, prompt_reference_id, call_id and error_message
+    only — a phrase from a log line will not match here and returns an empty result
+    that looks like "no such calls". For log bodies use search_trace_logs.
+
     The query param is OPTIONAL. When you have exact filter values, omit it.
     When provided, query text is LIKE-matched against event_name, node,
     campaign_id, prompt_reference_id, call_id, error_message — this is slower.
@@ -1631,6 +1687,526 @@ async def count_spans(
     if time_to:
         params["time_to"] = time_to
     return _fmt(await _get(ctx, "/search/count", params=params))
+
+
+# ── Fleet aggregation (server-side, one hop instead of a sweep) ────────
+
+
+def _window(params: dict, time_range_minutes: int, time_from: str, time_to: str) -> dict:
+    """Apply the time window every fleet endpoint shares. Mutates and returns params."""
+    if time_from:
+        params["time_from"] = time_from
+    elif time_range_minutes > 0:
+        params["time_range_minutes"] = time_range_minutes
+    if time_to:
+        params["time_to"] = time_to
+    return params
+
+
+async def _get_new_endpoint(ctx: Context, path: str, params: dict, needs: str) -> dict:
+    """GET an endpoint that may not be deployed yet, and say so if it isn't.
+
+    The backend and this client ship separately, so a 404 here means "your lens is
+    older than this tool", not "no data". Left as a raw HTTPStatusError that reads
+    like a broken tool rather than a version gap.
+    """
+    try:
+        return await _get(ctx, path, params=params)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise RuntimeError(
+                f"This lens backend does not have {path} yet — it needs {needs}. "
+                f"Nothing is wrong with your query. Use the alternative named in this "
+                f"tool's description until the backend is deployed."
+            ) from None
+        raise
+
+
+_GRANULARITY_MINUTES = {"5min": 5, "15min": 15, "1hour": 60}
+_MAX_BUCKETS = 800  # 30 days hourly (720) is a legitimate trend query; 5min over days is not
+
+
+def _check_granularity(granularity: str, time_range_minutes: int, time_from: str, time_to: str) -> None:
+    """Refuse a window/granularity pair that would return tens of thousands of rows.
+
+    These endpoints return one row per (bucket, node), so 30 days at 5min is ~8600 buckets
+    times every node. Failing with the arithmetic shown beats either a silent truncation or
+    a response that blows the tool output limit.
+    """
+    if granularity not in _GRANULARITY_MINUTES:
+        raise ValueError(
+            f"granularity must be one of {sorted(_GRANULARITY_MINUTES)}, got {granularity!r}"
+        )
+    if time_from:
+        return  # explicit windows are the caller's deliberate choice; cannot size it here
+    buckets = time_range_minutes / _GRANULARITY_MINUTES[granularity]
+    if buckets > _MAX_BUCKETS:
+        raise ValueError(
+            f"{time_range_minutes} minutes at {granularity} granularity is ~{int(buckets)} "
+            f"buckets per node, which will overflow the tool response. Use a coarser "
+            f"granularity or a shorter window (max ~{_MAX_BUCKETS} buckets)."
+        )
+
+
+_RETENTION = {
+    "mv": "aggregates retain 90 days — longer than the 30-day raw spans they summarise",
+    "spans": "raw spans retain 30 days",
+    "traces": "trace logs retain only 4 days",
+}
+
+
+@mcp.tool()
+async def latency_over_time(
+    ctx: Context,
+    granularity: str = "1hour",
+    nodes: str = "",
+    campaign_id: str = "",
+    agent_config_id: str = "",
+    prompt_ref: str = "",
+    time_range_minutes: int = 360,
+    time_from: str = "",
+    time_to: str = "",
+) -> str:
+    """Latency percentiles per node per time bucket — the fleet trend in one call.
+
+    USE THIS INSTEAD OF sweeping search_spans across time windows. Returns
+    p50/p90/p95/p99 + count for every node in every bucket, computed server-side
+    from a materialized view, so a week-long window costs the same as an hour.
+
+    Answers:
+    - "is latency getting worse?"            → compare early vs late buckets
+    - "which stage regressed, and when?"     → node column across buckets
+    - "was this worse last week?"            → time_from/time_to on that week
+
+    Reads a 5-minute materialized view retained for 90 DAYS — three times the
+    30-day raw span window. Fleet trends stay answerable long after the spans
+    that produced them have aged out.
+
+    Args:
+        granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day.
+        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, which is a lot of rows.
+        campaign_id: Restrict to a campaign (comma-separated for several).
+        agent_config_id: Restrict to an agent config.
+        prompt_ref: Restrict to a prompt reference ID.
+        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+    """
+    _check_granularity(granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": granularity}
+    if nodes:
+        params["nodes"] = nodes
+    if campaign_id:
+        params["campaign_id"] = campaign_id
+    if agent_config_id:
+        params["agent_id"] = agent_config_id
+    if prompt_ref:
+        params["prompt_ref"] = prompt_ref
+    _window(params, time_range_minutes, time_from, time_to)
+    data = await _get(ctx, "/observability/timeseries", params=params)
+    return _fmt({"retention": _RETENTION["mv"], **data})
+
+
+@mcp.tool()
+async def latency_breakdown(
+    ctx: Context,
+    campaign_id: str = "",
+    agent_config_id: str = "",
+    prompt_ref: str = "",
+    time_range_minutes: int = 360,
+    time_from: str = "",
+    time_to: str = "",
+) -> str:
+    """Percentiles per node and phase across the whole fleet — the stage attribution table.
+
+    One call replaces walking search_spans through llm. / stt. / tts. /
+    pipeline.* one prefix at a time. Returns count + p25/p50/p80/p90/p95/p99 per
+    (node, phase) over every matching span — hundreds of thousands of spans, not
+    a 100-row sample.
+
+    Use this to answer "which stage dominates latency" before drilling into any
+    single call. For one call's breakdown use aggregate_spans instead.
+
+    Reads raw spans (30-day window), so it is heavier than latency_over_time.
+    Narrow the window if it times out.
+
+    Args:
+        campaign_id: Restrict to a campaign (comma-separated for several).
+        agent_config_id: Restrict to an agent config.
+        prompt_ref: Restrict to a prompt reference ID.
+        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+    """
+    params: dict = {}
+    if campaign_id:
+        params["campaign_id"] = campaign_id
+    if agent_config_id:
+        params["agent_id"] = agent_config_id
+    if prompt_ref:
+        params["prompt_ref"] = prompt_ref
+    _window(params, time_range_minutes, time_from, time_to)
+    data = await _get(ctx, "/observability/breakdown", params=params)
+    return _fmt({"retention": _RETENTION["spans"], **data})
+
+
+@mcp.tool()
+async def event_counts_over_time(
+    ctx: Context,
+    event_types: str = "",
+    granularity: str = "1hour",
+    campaign_id: str = "",
+    agent_config_id: str = "",
+    time_range_minutes: int = 360,
+    time_from: str = "",
+    time_to: str = "",
+) -> str:
+    """Event counts per event_name per time bucket, with affected-call counts.
+
+    USE THIS INSTEAD OF calling count_spans once per event name or once per
+    provider. Returns every event_name broken out per bucket in one request.
+
+    Answers "how often did X fire, and is that rising?" — voicemail detections,
+    interruptions, capacity gates, provider selections, hotswaps.
+
+    Reads a materialized view retained for 90 DAYS.
+
+    Args:
+        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all.
+        granularity: "5min", "15min" or "1hour" (default).
+        campaign_id: Restrict to a campaign.
+        agent_config_id: Restrict to an agent config.
+        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+    """
+    _check_granularity(granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": granularity}
+    if event_types:
+        params["event_types"] = event_types
+    if campaign_id:
+        params["campaign_id"] = campaign_id
+    if agent_config_id:
+        params["agent_id"] = agent_config_id
+    _window(params, time_range_minutes, time_from, time_to)
+    data = await _get(ctx, "/observability/events", params=params)
+    return _fmt({"retention": _RETENTION["mv"], **data})
+
+
+@mcp.tool()
+async def error_counts_over_time(
+    ctx: Context,
+    granularity: str = "1hour",
+    nodes: str = "",
+    campaign_id: str = "",
+    prompt_ref: str = "",
+    time_range_minutes: int = 360,
+    time_from: str = "",
+    time_to: str = "",
+) -> str:
+    """Error span counts per node per time bucket, with affected-call counts.
+
+    The error counterpart to latency_over_time. Use it to find WHEN a provider
+    started failing, rather than counting errors one node at a time with
+    count_spans(level="error").
+
+    Reads a materialized view retained for 90 DAYS.
+
+    Args:
+        granularity: "5min", "15min" or "1hour" (default).
+        nodes: Comma-separated node names to restrict to. Empty returns all.
+        campaign_id: Restrict to a campaign.
+        prompt_ref: Restrict to a prompt reference ID.
+        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+    """
+    _check_granularity(granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": granularity}
+    if nodes:
+        params["nodes"] = nodes
+    if campaign_id:
+        params["campaign_id"] = campaign_id
+    if prompt_ref:
+        params["prompt_ref"] = prompt_ref
+    _window(params, time_range_minutes, time_from, time_to)
+    data = await _get(ctx, "/observability/error-timeseries", params=params)
+    return _fmt({"retention": _RETENTION["mv"], **data})
+
+
+@mcp.tool()
+async def tool_outcomes(
+    ctx: Context,
+    campaign_id: str = "",
+    prompt_ref: str = "",
+    time_range_minutes: int = 360,
+    time_from: str = "",
+    time_to: str = "",
+) -> str:
+    """Success/failure/timeout counts and durations per bot tool function.
+
+    Answers "which tool is failing or slow" across the fleet in one call —
+    per-tool outcome counts and latency, rather than searching node="tool.*"
+    and tallying by hand.
+
+    Args:
+        campaign_id: Restrict to a campaign.
+        prompt_ref: Restrict to a prompt reference ID.
+        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+    """
+    params: dict = {}
+    if campaign_id:
+        params["campaign_id"] = campaign_id
+    if prompt_ref:
+        params["prompt_ref"] = prompt_ref
+    _window(params, time_range_minutes, time_from, time_to)
+    return _fmt(await _get(ctx, "/observability/tools", params=params))
+
+
+@mcp.tool()
+async def slowest_calls(
+    ctx: Context,
+    node: str,
+    phase: str = "",
+    event_name: str = "",
+    metric: str = "value_ms",
+    campaign_id: str = "",
+    agent_config_id: str = "",
+    prompt_ref: str = "",
+    percentiles: str = "50,90",
+    order_by: str = "p90",
+    min_spans: int = 1,
+    time_range_minutes: int = 360,
+    time_from: str = "",
+    time_to: str = "",
+    limit: int = 50,
+) -> str:
+    """Rank every call in a window by a latency percentile — one query, whole population.
+
+    The fleet-wide answer to "which calls are worst, and is this call unusual".
+    Computed with a single GROUP BY in ClickHouse, so it covers every matching
+    call rather than a sample.
+
+    Prefer this over aggregate_calls for fleet questions: aggregate_calls scans the
+    most recent N calls one request at a time, whereas this ranks the whole
+    population in one hop. Use aggregate_calls when you want per-call metadata
+    (model, duration) alongside the numbers.
+
+    `cohort` is pooled over the entire window, not just the returned page — so it
+    stays a true population percentile even though `calls` is a top-N slice.
+
+    Takes the same metric= as aggregate_spans, so it also ranks calls by prompt
+    size: metric="metadata:prompt_tokens", event_name="llm.usage", order_by="max".
+
+    Args:
+        node: Node prefix to measure (e.g. "llm", "pipeline.bot_reaction_time"). Required — an unfiltered percentile mixes unrelated operations.
+        phase: Phase filter ("ttfb", "complete", "error").
+        event_name: Exact event_name filter (e.g. "llm.usage").
+        metric: "value_ms" (default) or "metadata:<key>" for a numeric metadata field.
+        campaign_id: Restrict to a campaign (comma-separated for several).
+        agent_config_id: Restrict to an agent config.
+        prompt_ref: Restrict to a prompt reference ID.
+        percentiles: Comma-separated percentiles (default "50,90").
+        order_by: Rank by this — a percentile like "p90", or avg/max/min/sum/count.
+        min_spans: Skip calls with fewer than this many matching spans — raise it to stop one-span calls topping the ranking.
+        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+        limit: Max calls returned (default 50, max 500).
+    """
+    if not node:
+        raise ValueError("node is required — an unfiltered cohort percentile is meaningless")
+    if not any((campaign_id, agent_config_id, prompt_ref)):
+        window = _window_minutes(time_range_minutes, time_from, time_to)
+        if window is None or window > _UNSCOPED_WINDOW_CAP_MIN:
+            raise ValueError(
+                f"Ranking a whole cohort scans and groups every span by call_id. Without a "
+                f"high-selectivity filter ({', '.join(_HIGH_SELECTIVITY)}), the window is "
+                f"capped at {_UNSCOPED_WINDOW_CAP_MIN} minutes (~2h) — node alone is too loose. "
+                f"Add campaign_id (or agent_config_id / prompt_ref) to rank over a wider window."
+            )
+    params: dict = {
+        "node": node,
+        "percentiles": percentiles,
+        "order_by": order_by,
+        "min_spans": max(min_spans, 1),
+        "limit": min(max(limit, 1), 500),
+    }
+    for key, val in (("phase", phase), ("event_name", event_name), ("campaign_id", campaign_id),
+                     ("agent_config_id", agent_config_id), ("prompt_ref", prompt_ref)):
+        if val:
+            params[key] = val
+    if metric and metric != "value_ms":
+        params["metric"] = metric
+    _window(params, time_range_minutes, time_from, time_to)
+    data = await _get_new_endpoint(
+        ctx, "/observability/call-percentiles", params,
+        needs="squadrun/lens#56 (use aggregate_calls meanwhile)",
+    )
+    return _fmt({"retention": _RETENTION["spans"], **data})
+
+
+@mcp.tool()
+async def list_filter_values(ctx: Context) -> str:
+    """List the values you can actually filter on — campaigns, models, providers, agents.
+
+    CALL THIS BEFORE GUESSING a campaign_id, llm_model, stt_provider or
+    prompt_reference_id. Returns the distinct values seen in the last 7 days, so a
+    filter built from it cannot silently match nothing.
+
+    Returns campaigns, prompt_refs, agents, agent_config_ids, llm_models,
+    llm_providers, stt_providers, tts_providers, customers, voice_mission_ids.
+
+    A filter value absent from this list will return zero rows — which is
+    indistinguishable from "the thing you asked about did not happen".
+
+    Feeds the filters on list_calls, search_spans, slowest_calls, latency_over_time
+    and latency_breakdown.
+    """
+    return _fmt(await _get(ctx, "/observability/filters"))
+
+
+@mcp.tool()
+async def search_trace_logs(
+    ctx: Context,
+    query: str,
+    time_range_minutes: int = 60,
+    time_from: str = "",
+    time_to: str = "",
+    level: str = "",
+    campaign_id: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Free-text search across raw log bodies for ALL calls — not one call at a time.
+
+    This is the fleet-wide log grep. Use it to find which calls contain a log
+    line, then drill in with download_trace_logs.
+
+    Not to be confused with search_spans, which matches span columns and cannot see
+    log text at all. If you are looking for a phrase a service logged, it is this
+    tool. Previously this meant calling
+    get_call_trace_logs once per call_sid, which needs the call list up front —
+    exactly what you do not have when hunting an unknown failure.
+
+    Examples:
+        search_trace_logs("rate limit exceeded")
+        search_trace_logs("connection error, will retry", time_range_minutes=180)
+        search_trace_logs("prompt cache", campaign_id="9407")
+
+    Multi-word queries are AND-ed as substrings; quote a phrase to keep it
+    together. This is a text scan over call_trace_logs, so keep the window tight
+    — and note trace logs retain only 4 DAYS, far less than spans' 30. An empty
+    result on an older call means the evidence aged out, not that it never
+    happened.
+
+    WINDOW LIMIT: unscoped (no campaign_id) this is bounded to 2 hours, because a
+    fleet-wide text scan of call_trace_logs times out past a few hours at current
+    log volume. You can walk a wider period by paging time_from/time_to in <=2h
+    slices. To search a wide window in one shot, pass campaign_id: it narrows to
+    that campaign's calls on the primary key first, which is ~100x faster and lifts
+    the limit to the full 4-day retention.
+
+    Args:
+        query: Text to find in log messages (required).
+        time_range_minutes: Look back N minutes (default 60). Max 120 (2h) unless campaign_id is set, then up to 5760 (4 days).
+        time_from: ISO8601 start. Unscoped, the from/to span must be <=2h; with campaign_id, any window.
+        time_to: ISO8601 end.
+        level: Level filter (mostly useless — trace logs are nearly all info).
+        campaign_id: Restrict to calls in a campaign. Strongly preferred — it makes the search fast and unlocks the full window.
+        limit: Max log lines (default 50, max 500).
+        offset: Row offset — the response carries has_more; page with offset=offset+limit.
+    """
+    if not query.strip():
+        raise ValueError("query is required — this endpoint is a text search")
+    if not campaign_id:
+        window = _window_minutes(time_range_minutes, time_from, time_to)
+        if window is None or window > _UNSCOPED_WINDOW_CAP_MIN:
+            raise ValueError(
+                f"A fleet-wide trace search (no campaign_id) is bounded to "
+                f"{_UNSCOPED_WINDOW_CAP_MIN} minutes (~2h) — an unbounded text scan over "
+                f"call_trace_logs times out at current scale. Either page the period in "
+                f"<=2h time_from/time_to slices, or pass campaign_id to search a wider window "
+                f"in one shot (it narrows on the primary key first, ~100x faster)."
+            )
+    params: dict = {"q": query, "limit": min(max(limit, 1), 500), "offset": max(offset, 0)}
+    if level:
+        params["level"] = level
+    if campaign_id:
+        params["campaign_id"] = campaign_id
+    _window(params, time_range_minutes, time_from, time_to)
+    data = await _get(ctx, "/search/traces", params=params)
+    return _fmt({"retention": _RETENTION["traces"], **data})
+
+
+@mcp.tool()
+async def get_call_config(call_sid: str, ctx: Context) -> str:
+    """Get the agent config JSON for a call, on its own.
+
+    Same data as get_call_details(sections="config"), but without fetching the
+    transcript server-side. Use when the question is purely about configuration.
+
+    This is the config TEMPLATE. For the rendered prompt actually sent to the
+    LLM, use get_call_prompt. Configs retain 30 days.
+
+    Args:
+        call_sid: The call SID.
+    """
+    call_sid = _sanitize_sid(call_sid)
+    return _fmt(await _get_new_endpoint(
+        ctx, f"/call/{call_sid}/config", {},
+        needs='squadrun/lens#56 (use get_call_details(sections="config") meanwhile)',
+    ))
+
+
+@mcp.tool()
+async def get_extraction_stats(
+    ctx: Context,
+    view: str = "outcomes",
+    customer: str = "",
+    campaign_id: str = "",
+    voice_mission_id: str = "",
+    granularity: str = "1hour",
+    time_range_minutes: int = 1440,
+    time_from: str = "",
+    time_to: str = "",
+) -> str:
+    """Entity-extraction (post-call) stats across the fleet — outcomes, latency, models.
+
+    The extraction-side counterpart to latency_over_time. Answers "what fraction
+    of extractions are failing, and on which model" without opening calls
+    one by one.
+
+    Args:
+        view: Which slice — "outcomes" (success/failure over time), "latency" (stage durations), "models" (per-model breakdown), or "filters" (valid filter values).
+        customer: Restrict to a customer/tenant.
+        campaign_id: Restrict to a campaign.
+        voice_mission_id: Restrict to a voice mission.
+        granularity: "5min", "15min" or "1hour" (default). Ignored by "models" and "filters".
+        time_range_minutes: Look back N minutes (default 1440 = 24h, max 43200).
+        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_to: ISO8601 end.
+    """
+    endpoints = {
+        "outcomes": "/observability/ee-outcomes",
+        "latency": "/observability/ee-latency",
+        "models": "/observability/ee-models",
+        "filters": "/observability/ee-filters",
+    }
+    if view not in endpoints:
+        raise ValueError(f"view must be one of {sorted(endpoints)}, got {view!r}")
+    params: dict = {}
+    if view in ("outcomes", "latency"):
+        params["granularity"] = granularity
+    if view != "filters":
+        for key, val in (("customer", customer), ("campaign_id", campaign_id),
+                         ("voice_mission_id", voice_mission_id)):
+            if val:
+                params[key] = val
+    _window(params, time_range_minutes, time_from, time_to)
+    return _fmt(await _get(ctx, endpoints[view], params=params))
 
 
 # ── Comparison tools ───────────────────────────────────────────────────
