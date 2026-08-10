@@ -44,6 +44,7 @@ except Exception:
 _SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
 _MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
 _COHORT_CONCURRENCY = 8
+_TRACE_UNSCOPED_MAX_MIN = 360  # fleet-wide trace-log text scan times out past ~6h; scope by campaign_id for wider
 
 _CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
 
@@ -2046,18 +2047,38 @@ async def search_trace_logs(
     result on an older call means the evidence aged out, not that it never
     happened.
 
+    WINDOW LIMIT: unscoped (no campaign_id) this is bounded to 6 hours, because a
+    fleet-wide text scan of call_trace_logs times out past that at current log
+    volume. To search a wider window — or an explicit time_from/time_to — pass
+    campaign_id: it narrows to that campaign's calls on the primary key first,
+    which is ~100x faster and lifts the limit to the full 4-day retention.
+
     Args:
         query: Text to find in log messages (required).
-        time_range_minutes: Look back N minutes (default 60, max 10080 = 7 days).
-        time_from: ISO8601 start (alternative to time_range_minutes).
-        time_to: ISO8601 end.
+        time_range_minutes: Look back N minutes (default 60). Max 360 (6h) unless campaign_id is set, then up to 5760 (4 days).
+        time_from: ISO8601 start. Requires campaign_id (an unscoped explicit window cannot be bounded cheaply).
+        time_to: ISO8601 end. Requires campaign_id.
         level: Level filter (mostly useless — trace logs are nearly all info).
-        campaign_id: Restrict to calls in a campaign.
+        campaign_id: Restrict to calls in a campaign. Strongly preferred — it makes the search fast and unlocks the full window.
         limit: Max log lines (default 50, max 500).
         offset: Row offset — the response carries has_more; page with offset=offset+limit.
     """
     if not query.strip():
         raise ValueError("query is required — this endpoint is a text search")
+    if not campaign_id:
+        if time_from or time_to:
+            raise ValueError(
+                "A fleet-wide trace search (no campaign_id) cannot use time_from/time_to — an "
+                "unbounded text scan over call_trace_logs times out at current scale. Pass "
+                "campaign_id to scope it (much faster, full 4-day window), or use "
+                "time_range_minutes <= 360."
+            )
+        if time_range_minutes > _TRACE_UNSCOPED_MAX_MIN:
+            raise ValueError(
+                f"A fleet-wide trace search is limited to {_TRACE_UNSCOPED_MAX_MIN} minutes "
+                f"(~6h); {time_range_minutes} would time out. Pass campaign_id to search wider "
+                f"(it narrows first, ~100x faster), or shorten the window."
+            )
     params: dict = {"q": query, "limit": min(max(limit, 1), 500), "offset": max(offset, 0)}
     if level:
         params["level"] = level
