@@ -63,7 +63,7 @@ def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> fl
             return (end - start).total_seconds() / 60
         except (ValueError, TypeError):
             return None
-    return 60.0
+    return None  # no explicit window → fail the cap closed (the request carries no time bound, so the guard must not treat it as a safe 60 min)
 
 _CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
 
@@ -285,7 +285,13 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
                 )
 
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise RuntimeError(
+                f"GET {path} returned {resp.status_code} with a non-JSON body "
+                f"(gateway or auth-proxy page?): {resp.text[:120]!r}"
+            ) from e
 
     raise RuntimeError(f"GET {path} exhausted retries")
 
@@ -304,8 +310,8 @@ statement of which tools you have. If a tool named below is missing from your
 session, the install is stale — re-run the install command in the lens-mcp README.
 
 ### turn_number is a BOT-UTTERANCE counter, not a user-turn counter
-It is `session_state.bot_stopped_count` in squadstack-bot, incremented on every
-BotStoppedSpeakingFrame. Fillers, idle nudges and any non-LLM TTS advance it.
+It counts bot utterances — incremented each time the bot stops speaking, so
+fillers, idle nudges and any non-LLM TTS advance it.
 Two calls at the same turn_number are NOT at equal conversational depth — do not
 use it to align calls when comparing them.
 
@@ -928,13 +934,13 @@ async def aggregate_calls(
     across the cohort, so you can see whether a slow p90 is one outlier or the
     whole campaign.
 
-    Example — campaign 9407 over the last 24h, ranked by LLM time-to-first-byte:
-        aggregate_calls(node="llm", phase="ttfb", campaign_id="9407",
+    Example — a campaign over the last 24h, ranked by LLM time-to-first-byte:
+        aggregate_calls(node="llm", phase="ttfb", campaign_id="<campaign_id>",
                         time_range_minutes=1440, sort_by="p90")
 
     Example — which calls in the campaign carry the biggest prompt context:
         aggregate_calls(node="llm", event_name="llm.usage",
-                        metric="metadata:prompt_tokens", campaign_id="9407",
+                        metric="metadata:prompt_tokens", campaign_id="<campaign_id>",
                         sort_by="max")
 
     `cohort` pools every span from every scanned call (the true fleet percentile,
@@ -1013,7 +1019,9 @@ async def aggregate_calls(
     sem = asyncio.Semaphore(_COHORT_CONCURRENCY)
 
     async def measure(call: dict) -> dict:
-        sid = call["call_id"]
+        sid = call.get("call_id")
+        if not sid:
+            return {"call_id": None, "error": "listing row had no call_id"}
         async with sem:
             try:
                 spans, complete = await _fetch_all_spans(ctx, sid, node=node, phase=phase)
@@ -1738,11 +1746,15 @@ def _check_granularity(granularity: str, time_range_minutes: int, time_from: str
             f"granularity must be one of {sorted(_GRANULARITY_MINUTES)}, got {granularity!r}"
         )
     if time_from:
-        return  # explicit windows are the caller's deliberate choice; cannot size it here
-    buckets = time_range_minutes / _GRANULARITY_MINUTES[granularity]
+        minutes = _window_minutes(0, time_from, time_to)
+        if minutes is None:
+            return  # open-ended or unparseable explicit window — cannot size, caller's choice
+    else:
+        minutes = time_range_minutes
+    buckets = minutes / _GRANULARITY_MINUTES[granularity]
     if buckets > _MAX_BUCKETS:
         raise ValueError(
-            f"{time_range_minutes} minutes at {granularity} granularity is ~{int(buckets)} "
+            f"{int(minutes)} minutes at {granularity} granularity is ~{int(buckets)} "
             f"buckets per node, which will overflow the tool response. Use a coarser "
             f"granularity or a shorter window (max ~{_MAX_BUCKETS} buckets)."
         )
@@ -2094,7 +2106,7 @@ async def search_trace_logs(
     Examples:
         search_trace_logs("rate limit exceeded")
         search_trace_logs("connection error, will retry", time_range_minutes=180)
-        search_trace_logs("prompt cache", campaign_id="9407")
+        search_trace_logs("prompt cache", campaign_id="<campaign_id>")
 
     Multi-word queries are AND-ed as substrings; quote a phrase to keep it
     together. This is a text scan over call_trace_logs, so keep the window tight

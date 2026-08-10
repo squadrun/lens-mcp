@@ -62,7 +62,7 @@ Then register it (`~/.claude.json`, per project or globally):
       "command": "uv",
       "args": ["--directory", "/Users/<you>/.cache/lens-mcp/repo", "run", "lens-mcp"],
       "env": {
-        "LENS_BASE_URL": "https://lens.agents.squadstack.com",
+        "LENS_BASE_URL": "https://<your-lens-host>",
         "LENS_GOOGLE_CLIENT_ID": "<google oauth client id>"
       }
     }
