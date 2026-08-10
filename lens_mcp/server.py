@@ -1670,6 +1670,32 @@ async def _get_new_endpoint(ctx: Context, path: str, params: dict, needs: str) -
         raise
 
 
+_GRANULARITY_MINUTES = {"5min": 5, "15min": 15, "1hour": 60}
+_MAX_BUCKETS = 800  # 30 days hourly (720) is a legitimate trend query; 5min over days is not
+
+
+def _check_granularity(granularity: str, time_range_minutes: int, time_from: str, time_to: str) -> None:
+    """Refuse a window/granularity pair that would return tens of thousands of rows.
+
+    These endpoints return one row per (bucket, node), so 30 days at 5min is ~8600 buckets
+    times every node. Failing with the arithmetic shown beats either a silent truncation or
+    a response that blows the tool output limit.
+    """
+    if granularity not in _GRANULARITY_MINUTES:
+        raise ValueError(
+            f"granularity must be one of {sorted(_GRANULARITY_MINUTES)}, got {granularity!r}"
+        )
+    if time_from:
+        return  # explicit windows are the caller's deliberate choice; cannot size it here
+    buckets = time_range_minutes / _GRANULARITY_MINUTES[granularity]
+    if buckets > _MAX_BUCKETS:
+        raise ValueError(
+            f"{time_range_minutes} minutes at {granularity} granularity is ~{int(buckets)} "
+            f"buckets per node, which will overflow the tool response. Use a coarser "
+            f"granularity or a shorter window (max ~{_MAX_BUCKETS} buckets)."
+        )
+
+
 _RETENTION = {
     "mv": "aggregates retain 90 days — longer than the 30-day raw spans they summarise",
     "spans": "raw spans retain 30 days",
@@ -1714,6 +1740,7 @@ async def latency_over_time(
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
     """
+    _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": granularity}
     if nodes:
         params["nodes"] = nodes
@@ -1801,6 +1828,7 @@ async def event_counts_over_time(
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
     """
+    _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": granularity}
     if event_types:
         params["event_types"] = event_types
@@ -1841,6 +1869,7 @@ async def error_counts_over_time(
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
     """
+    _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": granularity}
     if nodes:
         params["nodes"] = nodes
