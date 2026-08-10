@@ -268,7 +268,7 @@ span; the server requires a narrowing filter alongside it and search_spans check
 for one before making the request. Before lens#55 the unscoped form returned 0 hits
 instead of an error, which is why older notes claim it "fails for transport".
 Values match exactly and case-sensitively against the raw JSON value —
-`model:gemma4` hits; `model:gemma` and `model:GEMMA4` do not. Numbers and bools
+the full model id hits; a prefix of it, or a different case, does not. Numbers and bools
 match as written in the JSON (`prompt_tokens:26430`, `speech_final:true`).
 
 ### event_name / phase on /search need lens#55
@@ -279,7 +279,7 @@ if you see that, the filter did not apply and the rows are not what you asked fo
 count_spans has always honoured both.
 
 ### node accepts a prefix
-`node=llm.`, `node=llm` and `node=llm.openai` all work, on both search_spans and
+`node=llm.`, `node=llm` and `node=llm.<provider>` all work, on both search_spans and
 get_call_spans. Verified as genuinely filtering, along with level, campaign_id
 and value_ms_min/max.
 
@@ -302,8 +302,8 @@ growth is answerable from spans (30 days) rather than trace logs (4 days):
     aggregate_spans(call_sid, node="llm", event_name="llm.usage",
                     metric="metadata:prompt_tokens", group_by="turn")
 
-Coverage is provider-dependent: the simplismart path emits llm.usage, the OpenAI
-path does not (its llm.request spans carry only model and transport). Call-level
+Coverage is provider-dependent: some LLM providers emit llm.usage, others
+do not (their llm.request spans carry only model and transport). Call-level
 totals are on pipeline.cost_summary regardless. Where llm.usage is absent, per-turn
 growth still needs trace logs within their 4-day window: download_trace_logs then
 grep "prompt cache:".
@@ -540,7 +540,7 @@ async def get_call_spans(
     it pages to exhaustion and reports whether it saw everything. Use this tool
     to READ individual spans (errors, metadata, ordering), not to measure.
 
-    Each span has: node (e.g. "llm.openai"), phase (complete/error/ttfb),
+    Each span has: node (e.g. "llm.<provider>"), phase (complete/error/ttfb),
     value_ms (duration), level, error_message, and metadata.
 
     Note turn_number is a bot-utterance counter (bot_stopped_count), not a
@@ -810,8 +810,8 @@ async def aggregate_spans(
     That last one is the context-growth curve straight from spans (30-day
     retention) rather than from trace logs (4 days). llm.usage carries per-turn
     prompt_tokens, cache_read_input_tokens, completion_tokens and total_tokens —
-    but only on providers that emit it (simplismart does; the OpenAI path does
-    not, so there fall back to trace logs).
+    but only on providers that emit it (not all do); where it is absent, fall
+    back to trace logs.
 
     Returns overall count/min/mean/max/percentiles, a `trend` block comparing the
     median of the first third of the call against the last third, and per-group
@@ -824,7 +824,7 @@ async def aggregate_spans(
 
     Args:
         call_sid: The call SID.
-        node: Node prefix filter (e.g. "llm", "llm.openai", "tts."). Strongly recommended — mixing STT and LLM durations makes the percentiles meaningless.
+        node: Node prefix filter (e.g. "llm", "llm.<provider>", "tts."). Strongly recommended — mixing STT and LLM durations makes the percentiles meaningless.
         phase: Phase filter ("ttfb", "complete", "error", "connect").
         event_name: Exact event_name filter (e.g. "llm.usage"), applied client-side after fetching.
         group_by: One of "node", "phase", "event_name", "turn", or "turn_bucket:N" (e.g. "turn_bucket:10" bins every 10 bot utterances). Empty for a single overall result.
@@ -901,7 +901,7 @@ async def aggregate_calls(
     it is not a full-population query.
 
     Args:
-        node: Node prefix to measure (e.g. "llm", "stt.deepgram", "tts"). Required — an unfiltered cohort percentile mixes unrelated operations and means nothing.
+        node: Node prefix to measure (e.g. "llm", "stt.<provider>", "tts"). Required — an unfiltered cohort percentile mixes unrelated operations and means nothing.
         phase: Phase filter ("ttfb", "complete", "error").
         event_name: Exact event_name filter (e.g. "llm.usage"), applied client-side after fetching.
         metric: What to measure — "value_ms" (span duration, default) or "metadata:<key>" (e.g. "metadata:prompt_tokens").
@@ -1253,7 +1253,7 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
         grep -i "aggregation" /path/to/file.log       # turn aggregation
         grep "03:49:3" /path/to/file.log              # filter by timestamp
         grep -i "error\\|timeout" /path/to/file.log    # errors
-        grep -c "openai" /path/to/file.log            # count matches
+        grep -c "reconnect" /path/to/file.log            # count matches
 
     Args:
         call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456,ghi789").
@@ -1411,8 +1411,8 @@ async def search_spans(
     metadata_filter requires a node scope. Unscoped it cannot be answered without
     scanning every span, so the server rejects it — this tool checks first and
     fails locally with the same guidance, saving the round trip. Values match
-    exactly and case-sensitively: metadata_filter="model:gemma4" hits,
-    "model:gemma" and "model:GEMMA4" do not. Numbers and bools match as written
+    exactly and case-sensitively: the full model id hits, a prefix of it
+    or a different case does not. Numbers and bools match as written
     in the JSON ("prompt_tokens:26430", "speech_final:true").
 
     Returns at most 100 spans per page (use offset via repeated calls). This is
@@ -1427,7 +1427,7 @@ async def search_spans(
 
     Args:
         query: Optional free-text search (LIKE match — expensive). Prefer structured filters instead.
-        node: Node prefix filter (e.g. "llm.", "stt.", "tool."). Uses indexed SET column. "llm.", "llm" and "llm.openai" all work.
+        node: Node prefix filter (e.g. "llm.", "stt.", "tool."). Uses indexed SET column. "llm.", "llm" and "llm.<provider>" all work.
         event_name: Exact event name filter (e.g. "llm.usage", "pipeline.cost_summary"). Indexed.
         phase: Phase filter ("ttfb", "complete", "error", "timeout", "cancelled", "connect").
         level: Level filter — "info" or "error". Indexed.
@@ -1450,7 +1450,7 @@ async def search_spans(
             f"metadata_filter={metadata_filter!r} needs a node scope — metadata is "
             f"unindexed, so filtering it across a whole time window would scan every "
             f"span. The server rejects this too; failing here saves the round trip. "
-            f"Retry with e.g. node='llm.openai' or node='llm.'."
+            f"Retry with e.g. node='llm.<provider>' or node='llm.'."
         )
 
     params: dict = {"limit": min(limit, 100)}
