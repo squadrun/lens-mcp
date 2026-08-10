@@ -2014,6 +2014,7 @@ async def search_trace_logs(
     level: str = "",
     campaign_id: str = "",
     limit: int = 50,
+    offset: int = 0,
 ) -> str:
     """Free-text search across raw log bodies for ALL calls — not one call at a time.
 
@@ -2041,10 +2042,11 @@ async def search_trace_logs(
         level: Level filter (mostly useless — trace logs are nearly all info).
         campaign_id: Restrict to calls in a campaign.
         limit: Max log lines (default 50, max 500).
+        offset: Row offset — the response carries has_more; page with offset=offset+limit.
     """
     if not query.strip():
         raise ValueError("query is required — this endpoint is a text search")
-    params: dict = {"q": query, "limit": min(max(limit, 1), 500)}
+    params: dict = {"q": query, "limit": min(max(limit, 1), 500), "offset": max(offset, 0)}
     if level:
         params["level"] = level
     if campaign_id:
