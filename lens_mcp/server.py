@@ -36,6 +36,15 @@ GOOGLE_CLIENT_ID = os.environ.get("LENS_GOOGLE_CLIENT_ID", "")
 API_PREFIX = "/api/ext/v1"
 TIMEOUT = 30.0
 
+try:
+    _VERSION = __import__("importlib.metadata", fromlist=["version"]).version("lens-mcp")
+except Exception:
+    _VERSION = "unknown"
+
+_SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
+_MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
+_COHORT_CONCURRENCY = 8
+
 _CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
 
 
@@ -199,20 +208,106 @@ async def _ensure_auth(ctx: Context) -> None:
     lc["authenticated"] = True
 
 
+_RETRY_STATUS = {502, 503, 504}
+_MAX_RETRIES = 2
+
+
 async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
     await _ensure_auth(ctx)
     client = _client(ctx)
-    resp = await client.get(f"{API_PREFIX}{path}", params=params)
-    if resp.status_code == 401:
-        _clear_cached_token()
-        auth_headers = await _authenticate(client)
-        _set_auth(client, auth_headers)
-        resp = await client.get(f"{API_PREFIX}{path}", params=params)
-    resp.raise_for_status()
-    return resp.json()
+    url = f"{API_PREFIX}{path}"
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = await client.get(url, params=params)
+        except (httpx.TimeoutException, httpx.TransportError):
+            # Gateway blips on wide time ranges are transient; retrying here is far
+            # cheaper than surfacing a 504 and making the caller redo the analysis.
+            if attempt == _MAX_RETRIES:
+                raise
+            await asyncio.sleep(0.5 * 2**attempt)
+            continue
+
+        if resp.status_code == 401:
+            _clear_cached_token()
+            _set_auth(client, await _authenticate(client))
+            resp = await client.get(url, params=params)
+
+        if resp.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
+            await asyncio.sleep(0.5 * 2**attempt)
+            continue
+
+        resp.raise_for_status()
+        return resp.json()
+
+    raise RuntimeError(f"GET {path} exhausted retries")
 
 
 # ── Schema reference ───────────────────────────────────────────────────
+
+
+# Semantics the server-side schema does not carry, each of which has silently
+# produced a wrong answer: see squadrun/lens-mcp#1.
+_CLIENT_NOTES = f"""
+
+## Client notes (lens-mcp {_VERSION}) — read before computing any number
+
+Installs are per-machine `git pull`s, so this version is the only reliable
+statement of which tools you have. If a tool named below is missing from your
+session, the install is stale — re-run the install command in the lens-mcp README.
+
+### turn_number is a BOT-UTTERANCE counter, not a user-turn counter
+It is `session_state.bot_stopped_count` in squadstack-bot, incremented on every
+BotStoppedSpeakingFrame. Fillers, idle nudges and any non-LLM TTS advance it.
+Two calls at the same turn_number are NOT at equal conversational depth — do not
+use it to align calls when comparing them.
+
+### metadata_filter needs a node scope
+metadata is unindexed, so filtering it across a whole time window would scan every
+span; the server requires a narrowing filter alongside it and search_spans checks
+for one before making the request. Before lens#55 the unscoped form returned 0 hits
+instead of an error, which is why older notes claim it "fails for transport".
+Values match exactly and case-sensitively against the raw JSON value —
+the full model id hits; a prefix of it, or a different case, does not. Numbers and bools
+match as written in the JSON (`prompt_tokens:26430`, `speech_final:true`).
+
+### event_name / phase on /search need lens#55
+Before that fix the backend accepted both and filtered on neither, returning
+unfiltered rows with a 200. search_spans now checks the rows it gets back and
+prefixes the response with FILTER_IGNORED if the backend is still dropping them —
+if you see that, the filter did not apply and the rows are not what you asked for.
+count_spans has always honoured both.
+
+### node accepts a prefix
+`node=llm.`, `node=llm` and `node=llm.<provider>` all work, on both search_spans and
+get_call_spans. Verified as genuinely filtering, along with level, campaign_id
+and value_ms_min/max.
+
+### Row caps — never percentile a single page
+get_call_spans returns at most 500 rows per request, search_spans at most 100.
+A p90 computed from one truncated page is wrong with no warning. Use
+aggregate_spans (single call) or aggregate_calls (cohort): both page to
+exhaustion and report `complete: false` if they could not.
+
+### Retention differs per table
+call_metadata 6 months · call_spans 30 days · call_prompts / call_configs 30 days
+· entity-extraction logs 7 days · call_trace_logs 4 days. A call stays listable
+for 6 months but its log-level evidence is gone after 4 days.
+
+### Per-turn token counts exist in spans, but not for every provider
+The llm.usage event carries per-turn prompt_tokens, cache_read_input_tokens,
+completion_tokens and total_tokens, keyed by turn_number — so prompt-context
+growth is answerable from spans (30 days) rather than trace logs (4 days):
+
+    aggregate_spans(call_sid, node="llm", event_name="llm.usage",
+                    metric="metadata:prompt_tokens", group_by="turn")
+
+Coverage is provider-dependent: some LLM providers emit llm.usage, others
+do not (their llm.request spans carry only model and transport). Call-level
+totals are on pipeline.cost_summary regardless. Where llm.usage is absent, per-turn
+growth still needs trace logs within their 4-day window: download_trace_logs then
+grep "prompt cache:".
+"""
 
 
 @mcp.tool()
@@ -223,28 +318,62 @@ async def get_schema(ctx: Context) -> str:
     - What columns exist and which are indexed (fast to filter on)
     - The difference between call_spans (structured, fast) vs call_trace_logs (raw text, slow)
     - The correct query strategy to avoid expensive operations
+    - Semantics that silently produce wrong numbers if you assume them
+      (turn_number, metadata_filter scoping, row caps, retention)
 
     Key rules:
     - Use search_spans with structured filters (node, event_name, level, campaign_id) — these are indexed
     - NEVER broad-search trace logs — only drill into specific call_sids
     - Time bounds are mandatory for any search
+    - Never compute a percentile from raw span rows — use aggregate_spans/aggregate_calls
     """
     data = await _get(ctx, "/schema")
-    return data.get("schema", "")
+    return data.get("schema", "") + _CLIENT_NOTES
 
 
 # ── Per-call investigation (fast, indexed by call_id) ──────────────────
 
 
+_DETAIL_SECTIONS = ("metadata", "transcript", "entities", "recording", "config")
+
+
+def _parse_range(spec: str, total: int) -> tuple[int, int]:
+    """Parse a 1-based inclusive "N-M" range (either end optional) to slice bounds."""
+    spec = spec.strip()
+    if "-" not in spec:
+        raise ValueError(f"Invalid range {spec!r} — expected 'N-M', 'N-' or '-M'")
+    lo_s, hi_s = spec.split("-", 1)
+    lo = int(lo_s) if lo_s.strip() else 1
+    hi = int(hi_s) if hi_s.strip() else total
+    if lo < 1 or hi < lo:
+        raise ValueError(f"Invalid range {spec!r} — start must be >= 1 and <= end")
+    return lo - 1, hi
+
+
 @mcp.tool()
-async def get_call_details(call_sid: str, ctx: Context, include_config: bool = False) -> str:
-    """Get complete details for a call — metadata, transcript, entities, and config.
+async def get_call_details(
+    call_sid: str,
+    ctx: Context,
+    include_config: bool = False,
+    sections: str = "",
+    transcript_range: str = "",
+) -> str:
+    """Get details for a call — metadata, transcript, entities, and config.
 
     This is the primary 'what happened in this call' tool. Use it first when
-    investigating a call. Returns everything in one request.
+    investigating a call.
 
     ALREADY INCLUDES the full transcript — do NOT also call get_call_transcript,
     that would be redundant and waste tokens.
+
+    Long calls return 100KB+ payloads that overflow the tool output limit. Use
+    `sections` and `transcript_range` to fetch only what you need instead of
+    spilling the whole thing to disk:
+        sections="metadata"                    → just the call-level facts
+        sections="metadata,entities"           → facts + extraction outcome
+        sections="config"                      → the agent config alone
+        transcript_range="40-54"               → only utterances 40-54
+        sections="transcript", transcript_range="-20"  → first 20 utterances
 
     The config (agent_config_json) is large (~10K tokens). Set include_config=True
     only when you need the agent config. Default is False to save tokens.
@@ -256,15 +385,42 @@ async def get_call_details(call_sid: str, ctx: Context, include_config: bool = F
 
     Args:
         call_sid: The call SID (e.g. "abc123def456").
-        include_config: Include the full agent config JSON (default False). Set True only when investigating config.
+        include_config: Include the full agent config JSON (default False). Set True only when investigating config. Implied when sections includes "config".
+        sections: Comma-separated subset of metadata,transcript,entities,recording,config. Default (empty) returns all.
+        transcript_range: 1-based inclusive utterance range, e.g. "40-54", "40-" (from 40 on) or "-20" (first 20). Applies to the transcript section only.
     """
     call_sid = _sanitize_sid(call_sid)
+    wanted = [s.strip() for s in sections.split(",") if s.strip()]
+    unknown = [s for s in wanted if s not in _DETAIL_SECTIONS]
+    if unknown:
+        raise ValueError(
+            f"Unknown section(s) {unknown}. Valid: {', '.join(_DETAIL_SECTIONS)}"
+        )
+
     params = {}
-    if not include_config:
+    if not (include_config or "config" in wanted):
         params["include_config"] = "false"
     data = await _get(ctx, f"/call/{call_sid}/details", params=params or None)
     if "recording" in data:
-        data["recording"] = {"exists": data["recording"].get("exists", False)}
+        data["recording"] = {"exists": (data["recording"] or {}).get("exists", False)}
+
+    transcript = data.get("transcript")
+    if transcript_range and isinstance(transcript, dict):
+        turns = transcript.get("turns") or []
+        lo, hi = _parse_range(transcript_range, len(turns))
+        sliced = turns[lo:hi]
+        data["transcript"] = {
+            "turns": sliced,
+            "count": len(turns),
+            "returned_range": (
+                f"{lo + 1}-{lo + len(sliced)}"
+                if sliced
+                else f"empty — the transcript has only {len(turns)} utterances"
+            ),
+        }
+
+    if wanted:
+        data = {k: v for k, v in data.items() if k in wanted}
     return _fmt(data)
 
 
@@ -364,28 +520,512 @@ async def get_entity_prompt(call_sids: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def get_call_spans(call_sid: str, ctx: Context, node: str = "", phase: str = "") -> str:
+async def get_call_spans(
+    call_sid: str,
+    ctx: Context,
+    node: str = "",
+    phase: str = "",
+    limit: int = 500,
+    offset: int = 0,
+) -> str:
     """Get structured instrumentation spans and events for a call.
 
     Returns the latency waterfall: LLM/STT/TTS spans with timing,
     tool call durations, pipeline events, and error spans. Indexed by
-    call_id — fast even for calls with hundreds of spans. Capped at 500 rows.
+    call_id — fast even for calls with hundreds of spans.
 
-    Each span has: node (e.g. "llm.openai"), phase (complete/error/ttfb),
+    DO NOT compute percentiles, means or trends from this tool's output. The
+    server caps a response at 500 rows, so a busy call returns a truncated
+    prefix and any statistic derived from it is wrong. Use aggregate_spans —
+    it pages to exhaustion and reports whether it saw everything. Use this tool
+    to READ individual spans (errors, metadata, ordering), not to measure.
+
+    Each span has: node (e.g. "llm.<provider>"), phase (complete/error/ttfb),
     value_ms (duration), level, error_message, and metadata.
+
+    Note turn_number is a bot-utterance counter (bot_stopped_count), not a
+    user-turn counter — fillers and idle nudges advance it.
 
     Args:
         call_sid: The call SID.
         node: Filter by node PREFIX (e.g. "llm" matches all LLM spans; "stt" matches all STT spans). Always use this for targeted lookups.
         phase: Filter by phase (e.g. "error", "ttfb", "complete"). Useful for quick error checks.
+        limit: Rows per page (default 500, which is also the server maximum).
+        offset: Row offset, for paging past the first 500.
     """
     call_sid = _sanitize_sid(call_sid)
-    params: dict = {}
+    params: dict = {"limit": min(max(limit, 1), _SPAN_PAGE_SIZE), "offset": max(offset, 0)}
     if node:
         params["node"] = node
     if phase:
         params["phase"] = phase
-    return _fmt(await _get(ctx, f"/call/{call_sid}/spans", params=params or None))
+    data = await _get(ctx, f"/call/{call_sid}/spans", params=params)
+    if data.get("has_more"):
+        returned = len(data.get("spans", []))
+        data = {
+            "TRUNCATED": (
+                f"Showing {returned} of {data.get('total')} matching spans "
+                f"(offset {params['offset']}). Any percentile, mean or trend computed "
+                f"from these rows is WRONG. Use aggregate_spans for statistics, or "
+                f"page with offset={params['offset'] + returned} to read the rest."
+            ),
+            **data,
+        }
+    return _fmt(data)
+
+
+# ── Aggregation (pages the row cap away, returns statistics not rows) ──
+
+
+async def _fetch_all_spans(
+    ctx: Context, call_sid: str, node: str = "", phase: str = ""
+) -> tuple[list[dict], bool]:
+    """Page /call/{id}/spans to exhaustion. Returns (spans, complete).
+
+    A single response is capped at 500 rows and only advertises truncation via
+    has_more, so statistics computed from one unpaged response are silently wrong
+    on long calls. Paging is stable: rows come back in (turn_number, timestamp_ms)
+    order with no overlap between pages.
+    """
+    base: dict = {"limit": _SPAN_PAGE_SIZE}
+    if node:
+        base["node"] = node
+    if phase:
+        base["phase"] = phase
+
+    spans: list[dict] = []
+    offset = 0
+    for _ in range(_MAX_SPAN_PAGES):
+        data = await _get(ctx, f"/call/{call_sid}/spans", params={**base, "offset": offset})
+        page = data.get("spans", [])
+        spans.extend(page)
+        if not page or not data.get("has_more"):
+            return spans, True
+        offset += len(page)
+    return spans, False
+
+
+def _percentile(ordered: list[float], p: float) -> float:
+    """Linear-interpolated percentile over an already-sorted list."""
+    if len(ordered) == 1:
+        return ordered[0]
+    k = (len(ordered) - 1) * (p / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (k - lo)
+
+
+def _p_label(p: float) -> str:
+    return str(int(p)) if p == int(p) else str(p)
+
+
+def _parse_percentiles(spec: str) -> list[float]:
+    pcts = []
+    for part in spec.split(","):
+        part = part.strip().lstrip("pP")
+        if not part:
+            continue
+        try:
+            p = float(part)
+        except ValueError:
+            raise ValueError(f"Not a percentile: {part!r} — use e.g. '50,90,99'") from None
+        if not 0 <= p <= 100:
+            raise ValueError(f"Percentile out of range: {p}")
+        pcts.append(p)
+    if not pcts:
+        raise ValueError("No percentiles given — use e.g. '50,90,99'")
+    return sorted(set(pcts))
+
+
+def _stats(values: list[float], pcts: list[float], suffix: str = "_ms") -> dict:
+    ordered = sorted(values)
+    out: dict = {
+        "count": len(ordered),
+        f"min{suffix}": round(ordered[0], 1),
+        f"max{suffix}": round(ordered[-1], 1),
+        f"mean{suffix}": round(sum(ordered) / len(ordered), 1),
+        f"sum{suffix}": round(sum(ordered), 1),
+    }
+    for p in pcts:
+        out[f"p{_p_label(p)}{suffix}"] = round(_percentile(ordered, p), 1)
+    return out
+
+
+def _trend(values: list[float], suffix: str = "_ms") -> dict | None:
+    """Median of the first vs last third, in call order — 'is it growing?'.
+
+    Thirds rather than a regression: robust to the outliers that dominate voice
+    latency, and readable without a stats background.
+    """
+    if len(values) < 6:
+        return None
+    third = len(values) // 3
+    first = sorted(values[:third])
+    last = sorted(values[-third:])
+    a, b = _percentile(first, 50), _percentile(last, 50)
+    return {
+        f"first_third_p50{suffix}": round(a, 1),
+        f"last_third_p50{suffix}": round(b, 1),
+        "delta_pct": round((b - a) / a * 100, 1) if a else None,
+        "n_per_third": third,
+    }
+
+
+def _parse_metric(metric: str) -> tuple[str, str]:
+    """Validate a metric spec, returning (metadata_key or "", key suffix).
+
+    "value_ms" measures span durations; "metadata:<key>" measures a numeric field
+    inside the span's metadata JSON — which is where per-turn token counts live
+    (llm.usage carries prompt_tokens / cache_read_input_tokens / completion_tokens).
+    """
+    if metric in ("", "value_ms"):
+        return "", "_ms"
+    if metric.startswith("metadata:"):
+        key = metric.split(":", 1)[1].strip()
+        if not key:
+            raise ValueError('metric "metadata:" needs a key, e.g. "metadata:prompt_tokens"')
+        return key, ""
+    raise ValueError(
+        f"Unknown metric {metric!r} — use \"value_ms\" or \"metadata:<key>\" "
+        f'(e.g. "metadata:prompt_tokens")'
+    )
+
+
+def _metric_value(span: dict, key: str) -> float | None:
+    """Read the measured number off a span, or None if it carries no usable value."""
+    if not key:
+        val = span.get("value_ms")
+    else:
+        try:
+            val = json.loads(span.get("metadata") or "{}").get(key)
+        except (TypeError, ValueError):
+            return None
+    # bool is an int subclass — a flag is not a measurement.
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
+def _grouper(group_by: str):
+    """Return (key_fn, label_fn) for a group_by spec, or (None, None) for no grouping.
+
+    Keys sort the buckets, labels render them — they differ for turn buckets,
+    where the key is the numeric floor but the label is the turn range.
+    """
+    if not group_by:
+        return None, None
+    if group_by in ("node", "phase", "event_name"):
+        return (lambda s: s.get(group_by) or "(none)"), str
+    if group_by == "turn":
+        return (lambda s: int(s.get("turn_number") or 0)), (lambda k: f"turn {k}")
+    if group_by.startswith("turn_bucket:"):
+        raw = group_by.split(":", 1)[1].strip()
+        try:
+            size = int(raw) if raw else 10
+        except ValueError:
+            raise ValueError(f"turn_bucket size must be an integer, got {raw!r}") from None
+        if size < 1:
+            raise ValueError("turn_bucket size must be >= 1")
+        return (
+            lambda s: (int(s.get("turn_number") or 0) // size) * size,
+            lambda k: f"turns {k}-{k + size - 1}",
+        )
+    raise ValueError(
+        f"Unknown group_by {group_by!r}. Valid: node, phase, event_name, turn, turn_bucket:N"
+    )
+
+
+def _aggregate(spans: list[dict], pcts: list[float], group_by: str, metric: str = "value_ms") -> dict:
+    """Reduce spans to statistics. Spans carrying no value for the metric are counted, never measured."""
+    key, suffix = _parse_metric(metric)
+    measured = [(s, v) for s in spans if (v := _metric_value(s, key)) is not None]
+    result: dict = {
+        "metric": metric or "value_ms",
+        "spans_matched": len(spans),
+        "spans_measured": len(measured),
+        "spans_without_metric": len(spans) - len(measured),
+    }
+    if not measured:
+        result["note"] = (
+            f"No span carried a numeric {'metadata.' + key if key else 'value_ms'} — "
+            f"nothing to measure. Point-in-time events carry no duration, and not "
+            f"every node emits every metadata key."
+        )
+        return result
+
+    values = [v for _, v in measured]
+    result["overall"] = _stats(values, pcts, suffix)
+
+    # A trend over mixed node types measures the pipeline's shape, not degradation —
+    # only report it once the caller has narrowed to one kind of operation.
+    nodes = {s.get("node") for s, _ in measured}
+    if len(nodes) > 1:
+        result["trend"] = (
+            f"not computed — spans span {len(nodes)} node types, so a first-vs-last "
+            f"comparison would compare different operations. Re-run with node=<one node>."
+        )
+    else:
+        trend = _trend(values, suffix)
+        if trend:
+            result["trend"] = trend
+
+    key_fn, label_fn = _grouper(group_by)
+    if key_fn:
+        buckets: dict = {}
+        for span, value in measured:
+            buckets.setdefault(key_fn(span), []).append(value)
+        result["group_by"] = group_by
+        result["groups"] = [
+            {"group": label_fn(k), **_stats(buckets[k], pcts, suffix)} for k in sorted(buckets)
+        ]
+    return result
+
+
+@mcp.tool()
+async def aggregate_spans(
+    call_sid: str,
+    ctx: Context,
+    node: str = "",
+    phase: str = "",
+    event_name: str = "",
+    group_by: str = "",
+    percentiles: str = "50,90,99",
+    metric: str = "value_ms",
+) -> str:
+    """Compute statistics over a call's spans — server-paged, never truncated.
+
+    USE THIS INSTEAD OF get_call_spans WHENEVER YOU WANT A NUMBER. It pages past
+    the 500-row cap, so percentiles are computed over every matching span, and it
+    returns ~20 lines instead of hundreds of raw rows.
+
+    Answers directly:
+    - "how slow is LLM TTFB on this call?"   → node="llm", phase="ttfb"
+    - "is latency growing across the call?"  → the `trend` block, or
+                                               group_by="turn_bucket:10"
+    - "which stage dominates?"               → group_by="node"
+    - "is the prompt context growing?"       → event_name="llm.usage",
+                                               metric="metadata:prompt_tokens",
+                                               group_by="turn"
+
+    That last one is the context-growth curve straight from spans (30-day
+    retention) rather than from trace logs (4 days). llm.usage carries per-turn
+    prompt_tokens, cache_read_input_tokens, completion_tokens and total_tokens —
+    but only on providers that emit it (not all do); where it is absent, fall
+    back to trace logs.
+
+    Returns overall count/min/mean/max/percentiles, a `trend` block comparing the
+    median of the first third of the call against the last third, and per-group
+    statistics when group_by is set. `complete: false` means the call exceeded the
+    paging ceiling and the numbers cover only what was read — it never lies about
+    coverage.
+
+    Spans carrying no value for the chosen metric are counted under
+    spans_without_metric and excluded from the statistics.
+
+    Args:
+        call_sid: The call SID.
+        node: Node prefix filter (e.g. "llm", "llm.<provider>", "tts."). Strongly recommended — mixing STT and LLM durations makes the percentiles meaningless.
+        phase: Phase filter ("ttfb", "complete", "error", "connect").
+        event_name: Exact event_name filter (e.g. "llm.usage"), applied client-side after fetching.
+        group_by: One of "node", "phase", "event_name", "turn", or "turn_bucket:N" (e.g. "turn_bucket:10" bins every 10 bot utterances). Empty for a single overall result.
+        percentiles: Comma-separated percentiles (default "50,90,99").
+        metric: What to measure — "value_ms" (span duration, default) or "metadata:<key>" to measure a numeric metadata field such as "metadata:prompt_tokens".
+    """
+    call_sid = _sanitize_sid(call_sid)
+    pcts = _parse_percentiles(percentiles)
+    _grouper(group_by)  # validate before spending requests
+    _parse_metric(metric)
+
+    spans, complete = await _fetch_all_spans(ctx, call_sid, node=node, phase=phase)
+    if event_name:
+        spans = [s for s in spans if s.get("event_name") == event_name]
+
+    out = {
+        "call_id": call_sid,
+        "filters": {"node": node or None, "phase": phase or None, "event_name": event_name or None},
+        "complete": complete,
+        **_aggregate(spans, pcts, group_by, metric),
+    }
+    if not complete:
+        out["WARNING"] = (
+            f"Stopped after {_MAX_SPAN_PAGES * _SPAN_PAGE_SIZE} spans — statistics "
+            f"cover only that prefix of the call. Narrow with node/phase and re-run."
+        )
+    return _fmt(out)
+
+
+@mcp.tool()
+async def aggregate_calls(
+    ctx: Context,
+    node: str,
+    phase: str = "",
+    event_name: str = "",
+    metric: str = "value_ms",
+    campaign_id: str = "",
+    voice_mission_id: str = "",
+    agent_config_id: str = "",
+    customer: str = "",
+    llm_model: str = "",
+    status: str = "",
+    time_range_minutes: int = 60,
+    start_time_from: str = "",
+    start_time_to: str = "",
+    percentiles: str = "50,90",
+    max_calls: int = 20,
+    sort_by: str = "p90",
+) -> str:
+    """Compare one latency metric across a COHORT of calls — "is it this call or the fleet?".
+
+    The follow-up question after aggregate_spans finds a slow call. Selects calls
+    with list_calls filters, then computes the same statistic per call and pooled
+    across the cohort, so you can see whether a slow p90 is one outlier or the
+    whole campaign.
+
+    Example — campaign 9407 over the last 24h, ranked by LLM time-to-first-byte:
+        aggregate_calls(node="llm", phase="ttfb", campaign_id="9407",
+                        time_range_minutes=1440, sort_by="p90")
+
+    Example — which calls in the campaign carry the biggest prompt context:
+        aggregate_calls(node="llm", event_name="llm.usage",
+                        metric="metadata:prompt_tokens", campaign_id="9407",
+                        sort_by="max")
+
+    `cohort` pools every span from every scanned call (the true fleet percentile,
+    not an average of averages); `calls` lists per-call statistics sorted worst
+    first. Calls with no matching spans are reported as a count, not silently
+    dropped.
+
+    COST: one paged span fetch per call, so keep max_calls modest. Scanning 20
+    calls is a few seconds; 50 is the ceiling. Narrow the time window rather than
+    raising max_calls — this samples the most recent N calls matching the filters,
+    it is not a full-population query.
+
+    Args:
+        node: Node prefix to measure (e.g. "llm", "stt.<provider>", "tts"). Required — an unfiltered cohort percentile mixes unrelated operations and means nothing.
+        phase: Phase filter ("ttfb", "complete", "error").
+        event_name: Exact event_name filter (e.g. "llm.usage"), applied client-side after fetching.
+        metric: What to measure — "value_ms" (span duration, default) or "metadata:<key>" (e.g. "metadata:prompt_tokens").
+        campaign_id: Restrict to a campaign.
+        voice_mission_id: Restrict to a voice mission.
+        agent_config_id: Restrict to an agent config.
+        customer: Restrict to a customer/tenant.
+        llm_model: Restrict to an LLM model.
+        status: Call status filter (e.g. "completed") — worth setting, since in-progress calls have partial spans.
+        time_range_minutes: Look back N minutes (default 60, max 10080 = 7 days).
+        start_time_from: ISO8601 start (alternative to time_range_minutes, no cap).
+        start_time_to: ISO8601 end.
+        percentiles: Comma-separated percentiles (default "50,90").
+        max_calls: How many calls to scan (default 20, max 50).
+        sort_by: Rank calls by this stat — a percentile like "p90", or "mean", "max", "count".
+    """
+    if not node:
+        raise ValueError("node is required — an unfiltered cohort percentile is meaningless")
+    pcts = _parse_percentiles(percentiles)
+    metric_key, suffix = _parse_metric(metric)
+
+    if sort_by == "count":
+        sort_key = "count"
+    elif sort_by in ("mean", "max", "min", "sum"):
+        sort_key = f"{sort_by}{suffix}"
+    else:
+        try:
+            p = float(sort_by.lstrip("pP"))
+        except ValueError:
+            raise ValueError(
+                f"Unknown sort_by {sort_by!r} — use a percentile like 'p90', or mean/max/min/sum/count"
+            ) from None
+        pcts = sorted(set(pcts) | {p})
+        sort_key = f"p{_p_label(p)}{suffix}"
+
+    params: dict = {"limit": min(max(max_calls, 1), 50)}
+    for key, val in (
+        ("campaign_id", campaign_id),
+        ("voice_mission_id", voice_mission_id),
+        ("agent_config_id", agent_config_id),
+        ("customer", customer),
+        ("llm_model", llm_model),
+        ("status", status),
+        ("start_time_to", start_time_to),
+    ):
+        if val:
+            params[key] = val
+    if start_time_from:
+        params["start_time_from"] = start_time_from
+    elif time_range_minutes > 0:
+        params["time_range_minutes"] = min(time_range_minutes, 10080)
+
+    listing = await _get(ctx, "/calls", params=params)
+    calls = listing.get("calls", [])
+    if not calls:
+        return _fmt({"calls_matched": 0, "note": "No calls matched the filters — widen the time window."})
+
+    sem = asyncio.Semaphore(_COHORT_CONCURRENCY)
+
+    async def measure(call: dict) -> dict:
+        sid = call["call_id"]
+        async with sem:
+            try:
+                spans, complete = await _fetch_all_spans(ctx, sid, node=node, phase=phase)
+            except Exception as e:
+                # Isolate per call: one failure must not void the whole cohort.
+                return {"call_id": sid, "error": f"{type(e).__name__}: {e}"}
+        if event_name:
+            spans = [s for s in spans if s.get("event_name") == event_name]
+        values = [v for s in spans if (v := _metric_value(s, metric_key)) is not None]
+        row = {
+            "call_id": sid,
+            "start_time": call.get("start_time"),
+            "duration_ms": call.get("duration_ms"),
+            "llm_model": call.get("llm_model"),
+        }
+        if not values:
+            row["count"] = 0
+            return row
+        row.update(_stats(values, pcts, suffix))
+        if not complete:
+            row["incomplete"] = True
+        row["_values"] = values
+        return row
+
+    rows = await asyncio.gather(*(measure(c) for c in calls))
+
+    pooled: list[float] = []
+    measured, empty, failed = [], 0, []
+    for row in rows:
+        if row.get("error"):
+            failed.append(row)
+        elif row.get("count"):
+            pooled.extend(row.pop("_values"))
+            measured.append(row)
+        else:
+            empty += 1
+
+    measured.sort(key=lambda r: r.get(sort_key, 0), reverse=True)
+
+    out: dict = {
+        "metric": metric,
+        "filters": {
+            "node": node,
+            "phase": phase or None,
+            "event_name": event_name or None,
+            **{k: v for k, v in params.items() if k != "limit"},
+        },
+        "calls_scanned": len(calls),
+        "calls_with_spans": len(measured),
+        "calls_without_matching_spans": empty,
+        "sorted_by": sort_key,
+        "cohort": _stats(pooled, pcts, suffix) if pooled else None,
+        "calls": measured,
+    }
+    if failed:
+        out["failed"] = failed
+    if len(calls) == params["limit"]:
+        out["NOTE"] = (
+            f"Scanned the {params['limit']}-call ceiling — this is a sample of the most "
+            f"recent matching calls, not the full population. Narrow the time window to "
+            f"make the sample representative."
+        )
+    return _fmt(out)
 
 
 @mcp.tool()
@@ -613,7 +1253,7 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
         grep -i "aggregation" /path/to/file.log       # turn aggregation
         grep "03:49:3" /path/to/file.log              # filter by timestamp
         grep -i "error\\|timeout" /path/to/file.log    # errors
-        grep -c "openai" /path/to/file.log            # count matches
+        grep -c "reconnect" /path/to/file.log            # count matches
 
     Args:
         call_sids: One or more call SIDs, comma-separated (e.g. "abc123" or "abc123,def456,ghi789").
@@ -715,11 +1355,34 @@ async def download_prompts(call_sids: str, ctx: Context) -> str:
 # ── Structured search (fast, uses indexed columns) ────────────────────
 
 
+def _filters_dropped_by_server(data: dict, **filters: str) -> list[str]:
+    """Name any filter the server accepted but did not apply.
+
+    /search ignored event_name and phase until squadrun/lens#55, returning
+    unfiltered rows with a 200. Client and backend deploy separately, so checking
+    the rows we got back is the only way to tell a fixed backend from an old one.
+
+    One-sided by construction: no row matching the filter proves it was dropped,
+    but every row matching proves nothing — an ignored filter still looks correct
+    when the unfiltered page happens to be uniform. Silence here is not a pass.
+    """
+    rows = [m for call in data.get("calls", []) for m in call.get("matches", [])]
+    if not rows:
+        return []
+    return [
+        f"{field}={value!r}"
+        for field, value in filters.items()
+        if value and all(row.get(field) != value for row in rows)
+    ]
+
+
 @mcp.tool()
 async def search_spans(
     ctx: Context,
     query: str = "",
     node: str = "",
+    event_name: str = "",
+    phase: str = "",
     level: str = "",
     value_ms_min: float = 0,
     value_ms_max: float = 0,
@@ -745,11 +1408,28 @@ async def search_spans(
     When provided, query text is LIKE-matched against event_name, node,
     campaign_id, prompt_reference_id, call_id, error_message — this is slower.
 
+    metadata_filter requires a node scope. Unscoped it cannot be answered without
+    scanning every span, so the server rejects it — this tool checks first and
+    fails locally with the same guidance, saving the round trip. Values match
+    exactly and case-sensitively: the full model id hits, a prefix of it
+    or a different case does not. Numbers and bools match as written
+    in the JSON ("prompt_tokens:26430", "speech_final:true").
+
+    Returns at most 100 spans per page (use offset via repeated calls). This is
+    a row sampler, not a measurement tool — for percentiles across calls use
+    aggregate_calls, which pages properly.
+
+    If a response comes back with FILTER_IGNORED, the lens backend predates
+    squadrun/lens#55 and is dropping event_name/phase server-side: the rows are
+    real spans but not the ones you asked for. Do not draw conclusions from them.
+
     For known node/event values, check the bot repo for the latest instrumentation.
 
     Args:
         query: Optional free-text search (LIKE match — expensive). Prefer structured filters instead.
-        node: Node prefix filter (e.g. "llm.", "stt.", "tool."). Uses indexed SET column.
+        node: Node prefix filter (e.g. "llm.", "stt.", "tool."). Uses indexed SET column. "llm.", "llm" and "llm.<provider>" all work.
+        event_name: Exact event name filter (e.g. "llm.usage", "pipeline.cost_summary"). Indexed.
+        phase: Phase filter ("ttfb", "complete", "error", "timeout", "cancelled", "connect").
         level: Level filter — "info" or "error". Indexed.
         value_ms_min: Min duration in ms (find slow operations).
         value_ms_max: Max duration in ms.
@@ -759,17 +1439,29 @@ async def search_spans(
         customer: Filter by customer/tenant name.
         customer_exclude: Exclude a specific customer.
         include_metadata: If true, also search inside metadata JSON (slower).
-        metadata_filter: Key:value filter on metadata JSON (e.g. "outcome:error", "model:gpt-4").
+        metadata_filter: Key:value filter on metadata JSON (e.g. "outcome:error", "transport:sse"). REQUIRES node to also be set.
         time_range_minutes: Look back N minutes from now (default 60, max 10080 = 7 days).
         time_from: ISO8601 start time (alternative to time_range_minutes).
         time_to: ISO8601 end time.
         limit: Max results (default 50, max 100).
     """
+    if metadata_filter and not node:
+        raise ValueError(
+            f"metadata_filter={metadata_filter!r} needs a node scope — metadata is "
+            f"unindexed, so filtering it across a whole time window would scan every "
+            f"span. The server rejects this too; failing here saves the round trip. "
+            f"Retry with e.g. node='llm.<provider>' or node='llm.'."
+        )
+
     params: dict = {"limit": min(limit, 100)}
     if query:
         params["q"] = query
     if node:
         params["node"] = node
+    if event_name:
+        params["event_name"] = event_name
+    if phase:
+        params["phase"] = phase
     if level:
         params["level"] = level
     if value_ms_min > 0:
@@ -796,7 +1488,19 @@ async def search_spans(
         params["time_range_minutes"] = time_range_minutes
     if time_to:
         params["time_to"] = time_to
-    return _fmt(await _get(ctx, "/search", params=params))
+    data = await _get(ctx, "/search", params=params)
+    ignored = _filters_dropped_by_server(data, event_name=event_name, phase=phase)
+    if ignored:
+        data = {
+            "FILTER_IGNORED": (
+                f"This lens backend dropped {', '.join(ignored)} server-side — the rows below are "
+                f"real spans but NOT the ones you filtered for. Do not draw conclusions from them. "
+                f"Fixed by squadrun/lens#55; until it is deployed, use count_spans (which honours "
+                f"both) or filter within a call via aggregate_spans."
+            ),
+            **data,
+        }
+    return _fmt(data)
 
 
 @mcp.tool()
