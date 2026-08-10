@@ -44,7 +44,26 @@ except Exception:
 _SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
 _MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
 _COHORT_CONCURRENCY = 8
-_TRACE_UNSCOPED_MAX_MIN = 360  # fleet-wide trace-log text scan times out past ~6h; scope by campaign_id for wider
+# A fleet-wide trace-log scan and a sort on a non-indexed span column both read/sort the whole
+# matched set. Safe over a short window; unbounded they pressure the box. Cap the window to 2h
+# unless a high-selectivity filter (campaign_id/agent_config_id/prompt_ref) narrows first.
+_UNSCOPED_WINDOW_CAP_MIN = 120
+_HIGH_SELECTIVITY = ("campaign_id", "agent_config_id", "prompt_ref")
+
+
+def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> float | None:
+    """Effective look-back window in minutes; None if an explicit window can't be parsed
+    (treated as unbounded so an unparseable time_from cannot slip past a cap)."""
+    if time_range_minutes and time_range_minutes > 0:
+        return float(time_range_minutes)
+    if time_from:
+        try:
+            start = datetime.fromisoformat(time_from)
+            end = datetime.fromisoformat(time_to) if time_to else datetime.now(start.tzinfo)
+            return (end - start).total_seconds() / 60
+        except (ValueError, TypeError):
+            return None
+    return 60.0
 
 _CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
 
@@ -1972,6 +1991,15 @@ async def slowest_calls(
     """
     if not node:
         raise ValueError("node is required — an unfiltered cohort percentile is meaningless")
+    if not any((campaign_id, agent_config_id, prompt_ref)):
+        window = _window_minutes(time_range_minutes, time_from, time_to)
+        if window is None or window > _UNSCOPED_WINDOW_CAP_MIN:
+            raise ValueError(
+                f"Ranking a whole cohort scans and groups every span by call_id. Without a "
+                f"high-selectivity filter ({', '.join(_HIGH_SELECTIVITY)}), the window is "
+                f"capped at {_UNSCOPED_WINDOW_CAP_MIN} minutes (~2h) — node alone is too loose. "
+                f"Add campaign_id (or agent_config_id / prompt_ref) to rank over a wider window."
+            )
     params: dict = {
         "node": node,
         "percentiles": percentiles,
@@ -2047,17 +2075,18 @@ async def search_trace_logs(
     result on an older call means the evidence aged out, not that it never
     happened.
 
-    WINDOW LIMIT: unscoped (no campaign_id) this is bounded to 6 hours, because a
-    fleet-wide text scan of call_trace_logs times out past that at current log
-    volume. To search a wider window — or an explicit time_from/time_to — pass
-    campaign_id: it narrows to that campaign's calls on the primary key first,
-    which is ~100x faster and lifts the limit to the full 4-day retention.
+    WINDOW LIMIT: unscoped (no campaign_id) this is bounded to 2 hours, because a
+    fleet-wide text scan of call_trace_logs times out past a few hours at current
+    log volume. You can walk a wider period by paging time_from/time_to in <=2h
+    slices. To search a wide window in one shot, pass campaign_id: it narrows to
+    that campaign's calls on the primary key first, which is ~100x faster and lifts
+    the limit to the full 4-day retention.
 
     Args:
         query: Text to find in log messages (required).
-        time_range_minutes: Look back N minutes (default 60). Max 360 (6h) unless campaign_id is set, then up to 5760 (4 days).
-        time_from: ISO8601 start. Requires campaign_id (an unscoped explicit window cannot be bounded cheaply).
-        time_to: ISO8601 end. Requires campaign_id.
+        time_range_minutes: Look back N minutes (default 60). Max 120 (2h) unless campaign_id is set, then up to 5760 (4 days).
+        time_from: ISO8601 start. Unscoped, the from/to span must be <=2h; with campaign_id, any window.
+        time_to: ISO8601 end.
         level: Level filter (mostly useless — trace logs are nearly all info).
         campaign_id: Restrict to calls in a campaign. Strongly preferred — it makes the search fast and unlocks the full window.
         limit: Max log lines (default 50, max 500).
@@ -2066,18 +2095,14 @@ async def search_trace_logs(
     if not query.strip():
         raise ValueError("query is required — this endpoint is a text search")
     if not campaign_id:
-        if time_from or time_to:
+        window = _window_minutes(time_range_minutes, time_from, time_to)
+        if window is None or window > _UNSCOPED_WINDOW_CAP_MIN:
             raise ValueError(
-                "A fleet-wide trace search (no campaign_id) cannot use time_from/time_to — an "
-                "unbounded text scan over call_trace_logs times out at current scale. Pass "
-                "campaign_id to scope it (much faster, full 4-day window), or use "
-                "time_range_minutes <= 360."
-            )
-        if time_range_minutes > _TRACE_UNSCOPED_MAX_MIN:
-            raise ValueError(
-                f"A fleet-wide trace search is limited to {_TRACE_UNSCOPED_MAX_MIN} minutes "
-                f"(~6h); {time_range_minutes} would time out. Pass campaign_id to search wider "
-                f"(it narrows first, ~100x faster), or shorten the window."
+                f"A fleet-wide trace search (no campaign_id) is bounded to "
+                f"{_UNSCOPED_WINDOW_CAP_MIN} minutes (~2h) — an unbounded text scan over "
+                f"call_trace_logs times out at current scale. Either page the period in "
+                f"<=2h time_from/time_to slices, or pass campaign_id to search a wider window "
+                f"in one shot (it narrows on the primary key first, ~100x faster)."
             )
     params: dict = {"q": query, "limit": min(max(limit, 1), 500), "offset": max(offset, 0)}
     if level:
