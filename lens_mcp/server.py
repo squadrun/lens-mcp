@@ -27,6 +27,7 @@ from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 BASE_URL = os.environ.get("LENS_BASE_URL", "")
 if not BASE_URL:
@@ -209,6 +210,16 @@ async def lifespan(server: FastMCP):
 
 mcp = FastMCP("lens", lifespan=lifespan)
 
+# openWorldHint is True throughout: every tool hits the remote Lens API.
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+# The download_* tools write into the scratchpad dir, so they are not read-only.
+# They overwrite the same per-SID paths on a repeat call, hence idempotent.
+WRITES_LOCAL_FILES = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+
 
 def _client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_context["client"]
@@ -363,7 +374,7 @@ grep "prompt cache:".
 """
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_schema(ctx: Context) -> str:
     """Get the ClickHouse table schemas, column types, indexes, and query strategy.
 
@@ -403,7 +414,7 @@ def _parse_range(spec: str, total: int) -> tuple[int, int]:
     return lo - 1, hi
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_details(
     call_sid: str,
     ctx: Context,
@@ -477,7 +488,7 @@ async def get_call_details(
     return _fmt(data)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_transcript(call_sid: str, ctx: Context) -> str:
     """Get the full conversation transcript for a call.
 
@@ -493,7 +504,7 @@ async def get_call_transcript(call_sid: str, ctx: Context) -> str:
     return _fmt(await _get(ctx, f"/call/{call_sid}/transcript"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_prompt(call_sids: str, ctx: Context) -> str:
     """Get the rendered (interpolated) system prompt used for one or more calls.
 
@@ -530,7 +541,7 @@ async def get_call_prompt(call_sids: str, ctx: Context) -> str:
     return _fmt(results[0] if len(results) == 1 else {"prompts": list(results)})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_entity_prompt(call_sids: str, ctx: Context) -> str:
     """Get the rendered entity-extraction prompt (system + user) for one or more calls.
 
@@ -572,7 +583,7 @@ async def get_entity_prompt(call_sids: str, ctx: Context) -> str:
     return _fmt(results[0] if len(results) == 1 else {"prompts": list(results)})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_spans(
     call_sid: str,
     ctx: Context,
@@ -834,7 +845,7 @@ def _aggregate(spans: list[dict], pcts: list[float], group_by: str, metric: str 
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def aggregate_spans(
     call_sid: str,
     ctx: Context,
@@ -907,7 +918,7 @@ async def aggregate_spans(
     return _fmt(out)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def aggregate_calls(
     ctx: Context,
     node: str,
@@ -1087,7 +1098,7 @@ async def aggregate_calls(
     return _fmt(out)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_trace_logs(
     call_sid: str,
     ctx: Context,
@@ -1136,7 +1147,7 @@ async def get_call_trace_logs(
     return _fmt(await _get(ctx, f"/call/{call_sid}/traces", params=params))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_entities(call_sid: str, ctx: Context) -> str:
     """Get entity extraction results for a call.
 
@@ -1150,7 +1161,7 @@ async def get_call_entities(call_sid: str, ctx: Context) -> str:
     return _fmt(await _get(ctx, f"/call/{call_sid}/entities"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_context(call_sid: str, ctx: Context) -> str:
     """Get tool call details and pipeline summaries for a call.
 
@@ -1164,7 +1175,7 @@ async def get_call_context(call_sid: str, ctx: Context) -> str:
     return _fmt(await _get(ctx, f"/call/{call_sid}/context"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_lead_details(call_sid: str, ctx: Context) -> str:
     """Get lead details for a call — resolved lead data and custom variables side by side.
 
@@ -1256,7 +1267,7 @@ async def _download_logs(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITES_LOCAL_FILES)
 async def download_entity_logs(call_sids: str, ctx: Context) -> str:
     """Download entity-extraction worker logs for one or more calls, then grep locally.
 
@@ -1287,7 +1298,7 @@ async def download_entity_logs(call_sids: str, ctx: Context) -> str:
     return await _download_logs(ctx, call_sids, "ee-traces", "ee_traces", "entity extraction logs")
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITES_LOCAL_FILES)
 async def download_trace_logs(call_sids: str, ctx: Context) -> str:
     """Download trace logs for one or more calls to local files, then grep locally.
 
@@ -1342,7 +1353,7 @@ async def _get_or_none(ctx: Context, path: str) -> dict | None:
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITES_LOCAL_FILES)
 async def download_prompts(call_sids: str, ctx: Context) -> str:
     """Download the agent prompt and entity prompt for one or more calls to local files.
 
@@ -1435,7 +1446,7 @@ def _filters_dropped_by_server(data: dict, **filters: str) -> list[str]:
     ]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def search_spans(
     ctx: Context,
     query: str = "",
@@ -1567,7 +1578,7 @@ async def search_spans(
     return _fmt(data)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def list_calls(
     ctx: Context,
     campaign_id: str = "",
@@ -1641,7 +1652,7 @@ async def list_calls(
     return _fmt(await _get(ctx, "/calls", params=params))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def count_spans(
     ctx: Context,
     node: str = "",
@@ -1767,7 +1778,7 @@ _RETENTION = {
 }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def latency_over_time(
     ctx: Context,
     granularity: str = "1hour",
@@ -1819,7 +1830,7 @@ async def latency_over_time(
     return _fmt({"retention": _RETENTION["mv"], **data})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def latency_breakdown(
     ctx: Context,
     campaign_id: str = "",
@@ -1862,7 +1873,7 @@ async def latency_breakdown(
     return _fmt({"retention": _RETENTION["spans"], **data})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def event_counts_over_time(
     ctx: Context,
     event_types: str = "",
@@ -1905,7 +1916,7 @@ async def event_counts_over_time(
     return _fmt({"retention": _RETENTION["mv"], **data})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def error_counts_over_time(
     ctx: Context,
     granularity: str = "1hour",
@@ -1946,7 +1957,7 @@ async def error_counts_over_time(
     return _fmt({"retention": _RETENTION["mv"], **data})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def tool_outcomes(
     ctx: Context,
     campaign_id: str = "",
@@ -1977,7 +1988,7 @@ async def tool_outcomes(
     return _fmt(await _get(ctx, "/observability/tools", params=params))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def slowest_calls(
     ctx: Context,
     node: str,
@@ -2060,7 +2071,7 @@ async def slowest_calls(
     return _fmt({"retention": _RETENTION["spans"], **data})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def list_filter_values(ctx: Context) -> str:
     """List the values you can actually filter on — campaigns, models, providers, agents.
 
@@ -2080,7 +2091,7 @@ async def list_filter_values(ctx: Context) -> str:
     return _fmt(await _get(ctx, "/observability/filters"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def search_trace_logs(
     ctx: Context,
     query: str,
@@ -2153,7 +2164,7 @@ async def search_trace_logs(
     return _fmt({"retention": _RETENTION["traces"], **data})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_call_config(call_sid: str, ctx: Context) -> str:
     """Get the agent config JSON for a call, on its own.
 
@@ -2173,7 +2184,7 @@ async def get_call_config(call_sid: str, ctx: Context) -> str:
     ))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_extraction_stats(
     ctx: Context,
     view: str = "outcomes",
@@ -2224,7 +2235,7 @@ async def get_extraction_stats(
 # ── Comparison tools ───────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def compare_calls(call_sids: str, ctx: Context) -> str:
     """Compare 2-10 calls side by side — metadata and timing spans.
 
@@ -2239,7 +2250,7 @@ async def compare_calls(call_sids: str, ctx: Context) -> str:
     return _fmt(await _get(ctx, "/compare", params={"call_ids": ",".join(sids)}))
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def compare_prompts(
     call_sid_a: str, call_sid_b: str, ctx: Context
 ) -> str:
