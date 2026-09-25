@@ -26,11 +26,11 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 BASE_URL = os.environ.get("LENS_BASE_URL", "")
 if not BASE_URL:
@@ -237,10 +237,17 @@ def _client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_context["client"]
 
 
-def _out(data: dict | list) -> dict[str, Any]:
-    """A tool result as an object, so FastMCP sends it as structuredContent plus the same JSON
-    as text. Returning a str instead publishes it as one escaped string under "result"."""
-    return data if isinstance(data, dict) else {"result": data}
+# The Annotated metadata keeps the object outputSchema, and FastMCP still validates
+# structuredContent against it; returning the CallToolResult lets _out write the text block.
+ToolResult = Annotated[CallToolResult, dict[str, Any]]
+
+
+def _out(data: dict | list) -> CallToolResult:
+    """A tool result as structuredContent plus the same JSON as text, for clients that read
+    only text. Written compact: FastMCP's own text block is indented, about 1.5x the size."""
+    obj = data if isinstance(data, dict) else {"result": data}
+    text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=str)
+    return CallToolResult(content=[TextContent(type="text", text=text)], structuredContent=obj)
 
 
 async def _ensure_auth(ctx: Context) -> None:
@@ -435,7 +442,7 @@ async def get_call_details(
     include_config: bool = False,
     sections: str = "",
     transcript_range: str = "",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Get details for a call — metadata, transcript, entities, and config.
 
     This is the primary 'what happened in this call' tool. Use it first when
@@ -501,7 +508,7 @@ async def get_call_details(
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_transcript(call_sid: str, ctx: Context) -> dict[str, Any]:
+async def get_call_transcript(call_sid: str, ctx: Context) -> ToolResult:
     """Get the full conversation transcript for a call.
 
     NOTE: get_call_details already includes the transcript. Only use this
@@ -517,7 +524,7 @@ async def get_call_transcript(call_sid: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_prompt(call_sids: str, ctx: Context) -> dict[str, Any]:
+async def get_call_prompt(call_sids: str, ctx: Context) -> ToolResult:
     """Get the rendered (interpolated) system prompt used for one or more calls.
 
     This is the actual final prompt sent to the LLM — lead details and custom
@@ -554,7 +561,7 @@ async def get_call_prompt(call_sids: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_entity_prompt(call_sids: str, ctx: Context) -> dict[str, Any]:
+async def get_entity_prompt(call_sids: str, ctx: Context) -> ToolResult:
     """Get the rendered entity-extraction prompt (system + user) for one or more calls.
 
     This is the extraction-side counterpart to get_call_prompt:
@@ -603,7 +610,7 @@ async def get_call_spans(
     phase: str = "",
     limit: int = 500,
     offset: int = 0,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Get structured instrumentation spans and events for a call.
 
     Returns the latency waterfall: LLM/STT/TTS spans with timing,
@@ -869,7 +876,7 @@ async def aggregate_spans(
     group_by: str = "",
     percentiles: str = "50,90,99",
     metric: str = "value_ms",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Compute statistics over a call's spans — server-paged, never truncated.
 
     USE THIS INSTEAD OF get_call_spans WHENEVER YOU WANT A NUMBER. It pages past
@@ -951,7 +958,7 @@ async def aggregate_calls(
     percentiles: str = "50,90",
     max_calls: int = 20,
     sort_by: str = "p90",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Compare one latency metric across a COHORT of calls — "is it this call or the fleet?".
 
     The follow-up question after aggregate_spans finds a slow call. Selects calls
@@ -1122,7 +1129,7 @@ async def get_call_trace_logs(
     logger_name: str = "",
     level: str = "",
     limit: int = 50,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Query trace logs via ClickHouse — before calling this, check:
 
     1. Have you already called download_trace_logs for this call_sid?
@@ -1164,7 +1171,7 @@ async def get_call_trace_logs(
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_entities(call_sid: str, ctx: Context) -> dict[str, Any]:
+async def get_call_entities(call_sid: str, ctx: Context) -> ToolResult:
     """Get entity extraction results for a call.
 
     Returns extracted entities (outcome, answers like call_outcome,
@@ -1178,7 +1185,7 @@ async def get_call_entities(call_sid: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_context(call_sid: str, ctx: Context) -> dict[str, Any]:
+async def get_call_context(call_sid: str, ctx: Context) -> ToolResult:
     """Get tool call details and pipeline summaries for a call.
 
     Returns structured tool call records (with args, results, durations)
@@ -1192,7 +1199,7 @@ async def get_call_context(call_sid: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_lead_details(call_sid: str, ctx: Context) -> dict[str, Any]:
+async def get_lead_details(call_sid: str, ctx: Context) -> ToolResult:
     """Get lead details for a call — resolved lead data and custom variables side by side.
 
     Returns the lead name/identity as resolved at call start (from Redis
@@ -1486,7 +1493,7 @@ async def search_spans(
     time_from: str = "",
     time_to: str = "",
     limit: int = 50,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Search structured spans across all calls using indexed columns.
 
     THIS IS THE PRIMARY SEARCH TOOL. Prefer structured filters (node, level,
@@ -1614,7 +1621,7 @@ async def list_calls(
     start_time_from: str = "",
     start_time_to: str = "",
     limit: int = 20,
-) -> dict[str, Any]:
+) -> ToolResult:
     """List calls from call_metadata with structured filters.
 
     Queries the call_metadata table (one row per call, ReplacingMergeTree).
@@ -1684,7 +1691,7 @@ async def count_spans(
     time_range_minutes: int = 60,
     time_from: str = "",
     time_to: str = "",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Count matching spans without returning row data.
 
     Use this when someone asks "how many?" — returns the exact count and
@@ -1802,35 +1809,45 @@ def _check_granularity(
     return backend
 
 
-# Observed live: a single unfiltered hourly bucket returned ~80 distinct event_names
-# (2026-09-25 sample of event_counts_over_time) — buckets alone don't bound the response when
-# the fan-out dimension (node / event_name) is wide open. Measured on the actual row count
-# rather than a guessed fan-out factor, since cardinality varies by fleet and time.
-_MAX_ROWS_UNFILTERED = 2000
+# Claude Code warns above 10,000 tokens of MCP output and moves results over 25,000 tokens to a
+# file. Compact JSON runs ~3.2 chars/token (753 bytes -> 235 tokens in Axiom's measurement,
+# https://axiom.co/blog/designing-mcp-servers-for-wide-events), so this stays near the warning.
+# Sized on JSON length rather than a row count, because row width varies by tool and granularity.
+_RESPONSE_BUDGET_CHARS = 32_000
+
+
+def _json_chars(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str))
 
 
 def _summarize_overflow(
     data: dict,
-    fan_out_filter: str,
     fan_out_param: str,
     dim_key: str,
     sum_keys: tuple[str, ...],
     range_keys: tuple[str, ...] = (),
     caveat: str = "",
 ) -> dict:
-    """Swap an oversized unfiltered series for one total per dim_key over the whole window.
+    """Fit an oversized response into _RESPONSE_BUDGET_CHARS: one total per dim_key over the
+    whole window, plus the per-bucket rows of the largest dim_key values that still fit.
 
     The rows are already fetched, so a digest answers "which ones matter" at no extra cost,
     where refusing would waste the fetch and force a blind retry. range_keys are non-additive
     (percentiles), so they are reported as the [min, max] seen across buckets, never combined.
-    Skipped when fan_out_filter is set — a caller who named values chose that multiplier.
     """
     series = data.get("series")
-    if fan_out_filter or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
+    if not isinstance(series, list):
+        return data
+    rest = {k: v for k, v in data.items() if k != "series"}
+    row_chars = [_json_chars(row) + 1 for row in series]  # +1 for the separating comma
+    if sum(row_chars) + _json_chars(rest) <= _RESPONSE_BUDGET_CHARS:
         return data
     totals: dict = {}
-    for row in series:
-        t = totals.setdefault(row.get(dim_key), {dim_key: row.get(dim_key), "buckets": 0})
+    dim_chars: dict = {}
+    for row, chars in zip(series, row_chars, strict=True):
+        dim = row.get(dim_key)
+        dim_chars[dim] = dim_chars.get(dim, 0) + chars
+        t = totals.setdefault(dim, {dim_key: dim, "buckets": 0})
         t["buckets"] += 1
         for k in sum_keys:
             t[k] = t.get(k, 0) + (row.get(k) or 0)
@@ -1840,16 +1857,32 @@ def _summarize_overflow(
                 lo, hi = t.get(f"{k}_range", (v, v))
                 t[f"{k}_range"] = (round(min(lo, v), 1), round(max(hi, v), 1))
     ranked = sorted(totals.values(), key=lambda t: t.get(sum_keys[0], 0), reverse=True)
+
+    room = _RESPONSE_BUDGET_CHARS - _json_chars({**rest, "totals": ranked})
+    kept = []
+    for t in ranked:  # largest first, stopping at the first that doesn't fit, so kept is a top-K
+        if dim_chars[t[dim_key]] > room:
+            break
+        room -= dim_chars[t[dim_key]]
+        kept.append(t[dim_key])
+    kept_set = set(kept)
+    covered = (
+        f"`series` keeps the per-bucket rows of the top {len(kept)}."
+        if kept
+        else f"`series` is empty: even the largest {dim_key}'s rows don't fit."
+    )
     return {
         "TRUNCATED": (
-            f"{len(series)} rows with no {fan_out_param} filter is past the "
-            f"{_MAX_ROWS_UNFILTERED}-row budget, so the per-bucket series was replaced by one "
-            f"total per {dim_key} over the whole window, largest first.{caveat} For the time "
-            f"series, re-run with {fan_out_param}=<the {dim_key}s you care about>, narrow the "
-            f"window, or pass full_series=true for every row regardless of size."
+            f"The full series ({len(series)} rows, ~{sum(row_chars) // 1000} KB) is past the "
+            f"{_RESPONSE_BUDGET_CHARS // 1000} KB response budget. `totals` has one entry per "
+            f"{dim_key} ({len(ranked)}) over the whole window, largest first.{caveat} {covered} "
+            f"For the others, re-run with {fan_out_param}=<the {dim_key}s you need>, a coarser "
+            f"granularity or a shorter window, or pass full_series=true for every row regardless "
+            f"of size."
         ),
-        **{k: v for k, v in data.items() if k != "series"},
+        **rest,
         "totals": ranked,
+        "series": [row for row in series if row.get(dim_key) in kept_set],
     }
 
 
@@ -1941,7 +1974,7 @@ async def latency_over_time(
     time_from: str = "",
     time_to: str = "",
     full_series: bool = False,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Latency percentiles per node per time bucket — the fleet trend in one call.
 
     USE THIS INSTEAD OF sweeping search_spans across time windows. Returns
@@ -1958,19 +1991,20 @@ async def latency_over_time(
     that produced them have aged out.
 
     Without nodes, a bucket fans out across every distinct node seen fleet-wide. Past a
-    row budget the response carries TRUNCATED and one `totals` entry per node for the
-    whole window instead of `series` — then re-run with nodes= for the time series.
+    size budget the response carries TRUNCATED, one `totals` entry per node for the whole
+    window, and `series` for only the largest nodes that fit — then re-run
+    with nodes= for the others.
 
     Args:
         granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "10min" / "30min" / "1day": the backend has only these three, and percentiles can't be summed into coarser buckets — event_counts_over_time / error_counts_over_time offer them, since counts can.
-        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, summarized to totals past the row budget above.
+        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, summarized past the size budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
-        full_series: Return every per-bucket row even past the row budget, instead of the totals summary.
+        full_series: Return every per-bucket row even past the size budget, instead of the summary.
     """
     _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": granularity}
@@ -1987,7 +2021,6 @@ async def latency_over_time(
     if not full_series:
         data = _summarize_overflow(
             data,
-            nodes,
             "nodes",
             "node",
             ("count",),
@@ -2007,7 +2040,7 @@ async def latency_breakdown(
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Percentiles per node and phase across the whole fleet — the stage attribution table.
 
     One call replaces walking search_spans through llm. / stt. / tts. /
@@ -2052,7 +2085,7 @@ async def event_counts_over_time(
     time_from: str = "",
     time_to: str = "",
     full_series: bool = False,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Event counts per event_name per time bucket, with affected-call counts.
 
     USE THIS INSTEAD OF calling count_spans once per event name or once per
@@ -2064,19 +2097,20 @@ async def event_counts_over_time(
     Reads a materialized view retained for 90 DAYS.
 
     Without event_types, a bucket fans out across every distinct event_name seen
-    fleet-wide (commonly 50-100+). Past a row budget the response carries TRUNCATED
-    and one `totals` entry per event_name for the whole window instead of `series` —
-    then re-run with event_types= for the time series.
+    fleet-wide (commonly 50-100+). Past a size budget the response carries TRUNCATED,
+    one `totals` entry per event_name for the whole window, and `series` for only the
+    largest event_names that fit — then re-run with event_types= for the
+    others.
 
     Args:
-        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all, summarized to totals past the row budget above.
+        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all, summarized past the size budget above.
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for count, an upper bound for calls; see the response's NOTE.
         campaign_id: Restrict to a campaign.
         agent_config_id: Restrict to an agent config.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
-        full_series: Return every per-bucket row even past the row budget, instead of the totals summary.
+        full_series: Return every per-bucket row even past the size budget, instead of the summary.
     """
     backend_granularity = _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": backend_granularity}
@@ -2092,7 +2126,6 @@ async def event_counts_over_time(
     if not full_series:
         data = _summarize_overflow(
             data,
-            event_types,
             "event_types",
             "event_name",
             ("count", "calls"),
@@ -2112,7 +2145,7 @@ async def error_counts_over_time(
     time_from: str = "",
     time_to: str = "",
     full_series: bool = False,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Error span counts per node per time bucket, with affected-call counts.
 
     The error counterpart to latency_over_time. Use it to find WHEN a provider
@@ -2122,18 +2155,19 @@ async def error_counts_over_time(
     Reads a materialized view retained for 90 DAYS.
 
     Without nodes, a bucket fans out across every distinct node seen fleet-wide. Past a
-    row budget the response carries TRUNCATED and one `totals` entry per node for the
-    whole window instead of `series` — then re-run with nodes= for the time series.
+    size budget the response carries TRUNCATED, one `totals` entry per node for the whole
+    window, and `series` for only the largest nodes that fit — then re-run
+    with nodes= for the others.
 
     Args:
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
-        nodes: Comma-separated node names to restrict to. Empty returns all, summarized to totals past the row budget above.
+        nodes: Comma-separated node names to restrict to. Empty returns all, summarized past the size budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
-        full_series: Return every per-bucket row even past the row budget, instead of the totals summary.
+        full_series: Return every per-bucket row even past the size budget, instead of the summary.
     """
     backend_granularity = _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": backend_granularity}
@@ -2149,7 +2183,6 @@ async def error_counts_over_time(
     if not full_series:
         data = _summarize_overflow(
             data,
-            nodes,
             "nodes",
             "node",
             ("errors", "affected_calls"),
@@ -2166,7 +2199,7 @@ async def tool_outcomes(
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Success/failure/timeout counts and durations per bot tool function.
 
     Answers "which tool is failing or slow" across the fleet in one call —
@@ -2206,7 +2239,7 @@ async def slowest_calls(
     time_from: str = "",
     time_to: str = "",
     limit: int = 50,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Rank every call in a window by a latency percentile — one query, whole population.
 
     The fleet-wide answer to "which calls are worst, and is this call unusual".
@@ -2280,7 +2313,7 @@ async def slowest_calls(
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def list_filter_values(ctx: Context) -> dict[str, Any]:
+async def list_filter_values(ctx: Context) -> ToolResult:
     """List the values you can actually filter on — campaigns, models, providers, agents.
 
     CALL THIS BEFORE GUESSING a campaign_id, llm_model, stt_provider or
@@ -2310,7 +2343,7 @@ async def search_trace_logs(
     campaign_id: str = "",
     limit: int = 50,
     offset: int = 0,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Free-text search across raw log bodies for ALL calls — not one call at a time.
 
     This is the fleet-wide log grep. Use it to find which calls contain a log
@@ -2373,7 +2406,7 @@ async def search_trace_logs(
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_config(call_sid: str, ctx: Context) -> dict[str, Any]:
+async def get_call_config(call_sid: str, ctx: Context) -> ToolResult:
     """Get the agent config JSON for a call, on its own.
 
     Same data as get_call_details(sections="config"), but without fetching the
@@ -2407,7 +2440,7 @@ async def get_extraction_stats(
     time_range_minutes: int = 1440,
     time_from: str = "",
     time_to: str = "",
-) -> dict[str, Any]:
+) -> ToolResult:
     """Entity-extraction (post-call) stats across the fleet — outcomes, latency, models.
 
     The extraction-side counterpart to latency_over_time. Answers "what fraction
@@ -2449,7 +2482,7 @@ async def get_extraction_stats(
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def compare_calls(call_sids: str, ctx: Context) -> dict[str, Any]:
+async def compare_calls(call_sids: str, ctx: Context) -> ToolResult:
     """Compare 2-10 calls side by side — metadata and timing spans.
 
     Returns metadata (duration, outcome, providers, errors) and spans
@@ -2464,7 +2497,7 @@ async def compare_calls(call_sids: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def compare_prompts(call_sid_a: str, call_sid_b: str, ctx: Context) -> dict[str, Any]:
+async def compare_prompts(call_sid_a: str, call_sid_b: str, ctx: Context) -> ToolResult:
     """Diff the system prompts used in two calls.
 
     Returns a unified diff showing exactly what changed between the prompts.
