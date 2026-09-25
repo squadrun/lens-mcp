@@ -14,7 +14,7 @@ import sys
 os.environ.setdefault("LENS_BASE_URL", "http://localhost")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lens_mcp.server import (  # noqa: E402
+from lens_mcp.server import (
     _rollup_daily,
     _summarize_overflow,
     mcp,
@@ -30,11 +30,16 @@ def test_granularity_is_published_as_an_enum_per_tool():
 
     # latency_over_time can't roll percentiles up to a day — only counts are additive.
     assert TOOLS["latency_over_time"].inputSchema["properties"]["granularity"]["enum"] == [
-        "5min", "15min", "1hour",
+        "5min",
+        "15min",
+        "1hour",
     ]
     for name in ("event_counts_over_time", "error_counts_over_time"):
         assert TOOLS[name].inputSchema["properties"]["granularity"]["enum"] == [
-            "5min", "15min", "1hour", "1day",
+            "5min",
+            "15min",
+            "1hour",
+            "1day",
         ]
 
 

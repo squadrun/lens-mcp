@@ -12,7 +12,7 @@ import sys
 os.environ.setdefault("LENS_BASE_URL", "http://localhost")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lens_mcp.server import (  # noqa: E402
+from lens_mcp.server import (
     _aggregate,
     _filters_dropped_by_server,
     _grouper,
@@ -90,10 +90,7 @@ def test_turn_bucket_labels_and_order():
 
 
 def test_aggregate_excludes_events_and_guards_mixed_node_trend():
-    spans = [
-        {"node": "llm.openai", "turn_number": t, "value_ms": float(100 + t)}
-        for t in range(9)
-    ]
+    spans = [{"node": "llm.openai", "turn_number": t, "value_ms": float(100 + t)} for t in range(9)]
     spans.append({"node": "llm.openai", "turn_number": 9, "value_ms": None})  # event
 
     out = _aggregate(spans, [50], "turn_bucket:5")
@@ -105,7 +102,7 @@ def test_aggregate_excludes_events_and_guards_mixed_node_trend():
     assert isinstance(out["trend"], dict)
     assert out["trend"]["delta_pct"] > 0  # 100..108 is rising
 
-    mixed = spans + [{"node": "stt.deepgram", "turn_number": 0, "value_ms": 5.0}]
+    mixed = [*spans, {"node": "stt.deepgram", "turn_number": 0, "value_ms": 5.0}]
     assert isinstance(_aggregate(mixed, [50], "")["trend"], str)  # refused, not computed
 
     events_only = [{"node": "pipeline.call", "turn_number": 0, "value_ms": None}]
@@ -124,7 +121,10 @@ def test_parse_metric_and_extraction():
         except ValueError:
             pass
 
-    span = {"value_ms": 12.5, "metadata": '{"prompt_tokens": 26430, "model": "gemma4", "cache_hit": true}'}
+    span = {
+        "value_ms": 12.5,
+        "metadata": '{"prompt_tokens": 26430, "model": "gemma4", "cache_hit": true}',
+    }
     assert _metric_value(span, "") == 12.5
     assert _metric_value(span, "prompt_tokens") == 26430.0
     assert _metric_value(span, "model") is None  # strings are not measurements

@@ -19,10 +19,12 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import tempfile
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -39,7 +41,7 @@ API_PREFIX = "/api/ext/v1"
 TIMEOUT = 30.0
 
 try:
-    _VERSION = __import__("importlib.metadata", fromlist=["version"]).version("lens-mcp")
+    _VERSION = version("lens-mcp")
 except Exception:
     _VERSION = "unknown"
 
@@ -67,7 +69,8 @@ def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> fl
             return None
     return None  # no explicit window → fail the cap closed (the request carries no time bound, so the guard must not treat it as a safe 60 min)
 
-_CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
+
+_CALL_SID_PATTERN = re.compile(r"^[a-zA-Z0-9\-]+$")
 
 
 def _sanitize_sid(sid: str) -> str:
@@ -75,6 +78,7 @@ def _sanitize_sid(sid: str) -> str:
     if not sid or not _CALL_SID_PATTERN.match(sid):
         raise ValueError(f"Invalid call SID: {sid!r}")
     return sid
+
 
 _TOKEN_CACHE_PATH = Path.home() / ".cache" / "lens-mcp" / "token.json"
 
@@ -101,11 +105,15 @@ def _save_cached_token(token: str, username: str, expires_at: str) -> None:
     try:
         _TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = _TOKEN_CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "token": token,
-            "username": username,
-            "expires_at": expires_at,
-        }))
+        tmp.write_text(
+            json.dumps(
+                {
+                    "token": token,
+                    "username": username,
+                    "expires_at": expires_at,
+                }
+            )
+        )
         tmp.chmod(0o600)
         tmp.rename(_TOKEN_CACHE_PATH)
     except Exception:
@@ -120,7 +128,7 @@ def _is_token_valid(token: str) -> bool:
         payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
         claims = json.loads(base64.urlsafe_b64decode(payload))
         exp = claims.get("exp", 0)
-        return datetime.now(timezone.utc).timestamp() < exp
+        return datetime.now(UTC).timestamp() < exp
     except Exception:
         return False
 
@@ -146,7 +154,7 @@ async def _device_flow_auth(client: httpx.AsyncClient) -> dict | None:
         expires_in = code_data.get("expires_in", 1800)
         max_polls = expires_in // interval
 
-        print(f"\n  Lens MCP: Google authentication required")
+        print("\n  Lens MCP: Google authentication required")
         print(f"  Go to: {verification_url}")
         print(f"  Enter code: {user_code}\n", flush=True)
 
@@ -166,14 +174,15 @@ async def _device_flow_auth(client: httpx.AsyncClient) -> dict | None:
                     continue
                 if "token" in data:
                     _save_cached_token(data["token"], data.get("username", ""), data["expires_at"])
-                    print(f"  Authenticated as: {data.get('email', data.get('username', ''))}\n", flush=True)
+                    print(
+                        f"  Authenticated as: {data.get('email', data.get('username', ''))}\n",
+                        flush=True,
+                    )
                     return {"Authorization": f"Bearer {data['token']}"}
             else:
                 detail = ""
-                try:
+                with suppress(Exception):
                     detail = resp.json().get("detail", "")
-                except Exception:
-                    pass
                 if detail:
                     print(f"  Auth failed: {resp.status_code} {detail}", flush=True)
                 break
@@ -201,10 +210,12 @@ async def _authenticate(client: httpx.AsyncClient) -> dict:
         "  uv --directory ~/.cache/lens-mcp/repo run lens-mcp auth"
     )
 
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     async with httpx.AsyncClient(
-        base_url=BASE_URL, timeout=TIMEOUT,
+        base_url=BASE_URL,
+        timeout=TIMEOUT,
     ) as client:
         yield {"client": client, "authenticated": False}
 
@@ -460,9 +471,7 @@ async def get_call_details(
     wanted = [s.strip() for s in sections.split(",") if s.strip()]
     unknown = [s for s in wanted if s not in _DETAIL_SECTIONS]
     if unknown:
-        raise ValueError(
-            f"Unknown section(s) {unknown}. Valid: {', '.join(_DETAIL_SECTIONS)}"
-        )
+        raise ValueError(f"Unknown section(s) {unknown}. Valid: {', '.join(_DETAIL_SECTIONS)}")
 
     params = {}
     if not (include_config or "config" in wanted):
@@ -753,7 +762,7 @@ def _parse_metric(metric: str) -> tuple[str, str]:
             raise ValueError('metric "metadata:" needs a key, e.g. "metadata:prompt_tokens"')
         return key, ""
     raise ValueError(
-        f"Unknown metric {metric!r} — use \"value_ms\" or \"metadata:<key>\" "
+        f'Unknown metric {metric!r} — use "value_ms" or "metadata:<key>" '
         f'(e.g. "metadata:prompt_tokens")'
     )
 
@@ -802,7 +811,9 @@ def _grouper(group_by: str):
     )
 
 
-def _aggregate(spans: list[dict], pcts: list[float], group_by: str, metric: str = "value_ms") -> dict:
+def _aggregate(
+    spans: list[dict], pcts: list[float], group_by: str, metric: str = "value_ms"
+) -> dict:
     """Reduce spans to statistics. Spans carrying no value for the metric are counted, never measured."""
     key, suffix = _parse_metric(metric)
     measured = [(s, v) for s in spans if (v := _metric_value(s, key)) is not None]
@@ -1028,7 +1039,9 @@ async def aggregate_calls(
     listing = await _get(ctx, "/calls", params=params)
     calls = listing.get("calls", [])
     if not calls:
-        return _out({"calls_matched": 0, "note": "No calls matched the filters — widen the time window."})
+        return _out(
+            {"calls_matched": 0, "note": "No calls matched the filters — widen the time window."}
+        )
 
     sem = asyncio.Semaphore(_COHORT_CONCURRENCY)
 
@@ -1223,7 +1236,8 @@ async def _download_logs(
         filepath = os.path.join(scratchpad, f"{sid}_{file_suffix}.log")
 
         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-            line_count = sum(1 for _ in open(filepath))
+            with open(filepath) as f:
+                line_count = sum(1 for _ in f)
             return f"{sid}: already downloaded ({line_count} lines) -> {filepath}"
 
         total_lines = 0
@@ -1237,7 +1251,9 @@ async def _download_logs(
                     offset = 0
                     for _ in range(max_batches):
                         data = await _get(
-                            ctx, f"/call/{sid}/{endpoint}", params={"limit": batch_size, "offset": offset}
+                            ctx,
+                            f"/call/{sid}/{endpoint}",
+                            params={"limit": batch_size, "offset": offset},
                         )
                         traces = data.get("traces", [])
                         if not traces:
@@ -1748,7 +1764,9 @@ _GRANULARITY_MINUTES = {"5min": 5, "15min": 15, "1hour": 60}
 _MAX_BUCKETS = 800  # 30 days hourly (720) is a legitimate trend query; 5min over days is not
 
 
-def _check_granularity(granularity: str, time_range_minutes: int, time_from: str, time_to: str) -> None:
+def _check_granularity(
+    granularity: str, time_range_minutes: int, time_from: str, time_to: str
+) -> None:
     """Refuse a window/granularity pair that would return tens of thousands of rows.
 
     Bounds buckets alone — these endpoints return one row per (bucket, node-or-event_name), so
@@ -1915,7 +1933,12 @@ async def latency_over_time(
     data = await _get(ctx, "/observability/timeseries", params=params)
     if not full_series:
         data = _summarize_overflow(
-            data, nodes, "nodes", "node", ("count",), ("p50_ms", "p90_ms", "p95_ms", "p99_ms"),
+            data,
+            nodes,
+            "nodes",
+            "node",
+            ("count",),
+            ("p50_ms", "p90_ms", "p95_ms", "p99_ms"),
             caveat=" Percentiles can't be combined across buckets, so each p*_ms_range is the "
             "[min, max] seen across them.",
         )
@@ -2022,7 +2045,11 @@ async def event_counts_over_time(
         )
     if not full_series:
         data = _summarize_overflow(
-            data, event_types, "event_types", "event_name", ("count", "calls"),
+            data,
+            event_types,
+            "event_types",
+            "event_name",
+            ("count", "calls"),
             caveat=" `calls` totals are upper bounds (a call active in several buckets counts in "
             "each)." + ("" if granularity == "1day" else ' granularity="1day" cuts rows 24x.'),
         )
@@ -2083,9 +2110,14 @@ async def error_counts_over_time(
         )
     if not full_series:
         data = _summarize_overflow(
-            data, nodes, "nodes", "node", ("errors", "affected_calls"),
+            data,
+            nodes,
+            "nodes",
+            "node",
+            ("errors", "affected_calls"),
             caveat=" `affected_calls` totals are upper bounds (a call active in several buckets "
-            "counts in each)." + ("" if granularity == "1day" else ' granularity="1day" cuts rows 24x.'),
+            "counts in each)."
+            + ("" if granularity == "1day" else ' granularity="1day" cuts rows 24x.'),
         )
     return _out({"retention": _RETENTION["mv"], **data})
 
@@ -2190,15 +2222,22 @@ async def slowest_calls(
         "min_spans": max(min_spans, 1),
         "limit": min(max(limit, 1), 500),
     }
-    for key, val in (("phase", phase), ("event_name", event_name), ("campaign_id", campaign_id),
-                     ("agent_config_id", agent_config_id), ("prompt_ref", prompt_ref)):
+    for key, val in (
+        ("phase", phase),
+        ("event_name", event_name),
+        ("campaign_id", campaign_id),
+        ("agent_config_id", agent_config_id),
+        ("prompt_ref", prompt_ref),
+    ):
         if val:
             params[key] = val
     if metric and metric != "value_ms":
         params["metric"] = metric
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get_new_endpoint(
-        ctx, "/observability/call-percentiles", params,
+        ctx,
+        "/observability/call-percentiles",
+        params,
         needs="squadrun/lens#56 (use aggregate_calls meanwhile)",
     )
     return _out({"retention": _RETENTION["spans"], **data})
@@ -2311,10 +2350,14 @@ async def get_call_config(call_sid: str, ctx: Context) -> dict[str, Any]:
         call_sid: The call SID.
     """
     call_sid = _sanitize_sid(call_sid)
-    return _out(await _get_new_endpoint(
-        ctx, f"/call/{call_sid}/config", {},
-        needs='squadrun/lens#56 (use get_call_details(sections="config") meanwhile)',
-    ))
+    return _out(
+        await _get_new_endpoint(
+            ctx,
+            f"/call/{call_sid}/config",
+            {},
+            needs='squadrun/lens#56 (use get_call_details(sections="config") meanwhile)',
+        )
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2355,8 +2398,11 @@ async def get_extraction_stats(
     if view in ("outcomes", "latency"):
         params["granularity"] = granularity
     if view != "filters":
-        for key, val in (("customer", customer), ("campaign_id", campaign_id),
-                         ("voice_mission_id", voice_mission_id)):
+        for key, val in (
+            ("customer", customer),
+            ("campaign_id", campaign_id),
+            ("voice_mission_id", voice_mission_id),
+        ):
             if val:
                 params[key] = val
     _window(params, time_range_minutes, time_from, time_to)
@@ -2382,9 +2428,7 @@ async def compare_calls(call_sids: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def compare_prompts(
-    call_sid_a: str, call_sid_b: str, ctx: Context
-) -> dict[str, Any]:
+async def compare_prompts(call_sid_a: str, call_sid_b: str, ctx: Context) -> dict[str, Any]:
     """Diff the system prompts used in two calls.
 
     Returns a unified diff showing exactly what changed between the prompts.
@@ -2397,10 +2441,13 @@ async def compare_prompts(
     """
     call_sid_a = _sanitize_sid(call_sid_a)
     call_sid_b = _sanitize_sid(call_sid_b)
-    return _out(await _get(
-        ctx, "/compare/prompt-diff",
-        params={"call_id_a": call_sid_a, "call_id_b": call_sid_b},
-    ))
+    return _out(
+        await _get(
+            ctx,
+            "/compare/prompt-diff",
+            params={"call_id_a": call_sid_a, "call_id_b": call_sid_b},
+        )
+    )
 
 
 async def _run_auth():
@@ -2417,9 +2464,8 @@ async def _run_auth():
         if result:
             print("Authentication successful. You can now use Lens MCP.")
             return True
-        else:
-            print("Authentication failed.")
-            return False
+        print("Authentication failed.")
+        return False
 
 
 async def _ensure_auth_before_serve():
@@ -2433,13 +2479,12 @@ async def _ensure_auth_before_serve():
 
 
 def main():
-    import sys as _sys
-    if len(_sys.argv) > 1 and _sys.argv[1] == "auth":
+    if len(sys.argv) > 1 and sys.argv[1] == "auth":
         asyncio.run(_run_auth())
-    elif len(_sys.argv) > 1 and _sys.argv[1] == "serve":
+    elif len(sys.argv) > 1 and sys.argv[1] == "serve":
         if not asyncio.run(_ensure_auth_before_serve()):
             return
-        port = int(_sys.argv[2]) if len(_sys.argv) > 2 else 8000
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
         mcp.settings.port = port
         mcp.run(transport="sse")
     else:

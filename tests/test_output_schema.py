@@ -15,9 +15,9 @@ import sys
 os.environ.setdefault("LENS_BASE_URL", "http://localhost")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mcp import types  # noqa: E402
+from mcp import types
 
-import lens_mcp.server as server  # noqa: E402
+import lens_mcp.server as server
 
 TEXT_TOOLS = {"get_schema", "download_entity_logs", "download_trace_logs", "download_prompts"}
 STRING_WRAPPER = {"result": {"title": "Result", "type": "string"}}
@@ -60,12 +60,16 @@ def test_structured_content_is_the_object_and_text_is_the_same_json():
 
 
 def test_full_series_bypasses_the_overflow_summary():
-    rows = [{"ts": f"t{i}", "event_name": f"e{i % 50}", "count": 1, "calls": 1} for i in range(3000)]
+    rows = [
+        {"ts": f"t{i}", "event_name": f"e{i % 50}", "count": 1, "calls": 1} for i in range(3000)
+    ]
 
     summarized = _call("event_counts_over_time", {}, {"series": rows}).structuredContent
     assert "totals" in summarized and "series" not in summarized
 
-    full = _call("event_counts_over_time", {"full_series": True}, {"series": rows}).structuredContent
+    full = _call(
+        "event_counts_over_time", {"full_series": True}, {"series": rows}
+    ).structuredContent
     assert len(full["series"]) == 3000 and "TRUNCATED" not in full
 
 

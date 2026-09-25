@@ -13,7 +13,7 @@ import sys
 os.environ.setdefault("LENS_BASE_URL", "http://localhost")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lens_mcp.server import mcp  # noqa: E402
+from lens_mcp.server import mcp
 
 WRITERS = {"download_entity_logs", "download_trace_logs", "download_prompts"}
 
