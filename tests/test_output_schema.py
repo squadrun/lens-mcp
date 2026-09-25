@@ -56,8 +56,8 @@ def test_structured_content_is_the_object_and_text_is_the_same_json():
 
     assert r.isError is False
     assert r.structuredContent == payload
-    # Text-only clients read the same JSON value; the bytes differ (non-ASCII is unescaped).
-    assert json.loads(r.content[0].text) == payload
+    # Text-only clients read the same JSON value, written compact with non-ASCII unescaped.
+    assert r.content[0].text == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
 def test_full_series_bypasses_the_overflow_summary():
@@ -66,12 +66,26 @@ def test_full_series_bypasses_the_overflow_summary():
     ]
 
     summarized = _call("event_counts_over_time", {}, {"series": rows}).structuredContent
-    assert "totals" in summarized and "series" not in summarized
+    assert "TRUNCATED" in summarized and len(summarized["series"]) < len(rows)
 
     full = _call(
         "event_counts_over_time", {"full_series": True}, {"series": rows}
     ).structuredContent
     assert len(full["series"]) == 3000 and "TRUNCATED" not in full
+
+
+def test_named_filters_are_bounded_too():
+    rows = [{"ts": f"t{i}", "event_name": "a", "count": 1, "calls": 1} for i in range(3000)]
+    out = _call("event_counts_over_time", {"event_types": "a"}, {"series": rows}).structuredContent
+    assert "TRUNCATED" in out
+
+
+def test_overflow_percentile_ranges_pass_output_validation():
+    rows = [{"ts": f"t{i}", "node": f"n{i % 30}", "count": 1, "p90_ms": 1.0} for i in range(3000)]
+    r = _call("latency_over_time", {}, {"series": rows})
+    assert r.isError is False
+    # (min, max) tuples in structuredContent reach text-only clients as the same JSON arrays.
+    assert json.loads(r.content[0].text) == json.loads(json.dumps(r.structuredContent))
 
 
 def test_rollup_without_a_series_list_errors_instead_of_mislabelling_rows():

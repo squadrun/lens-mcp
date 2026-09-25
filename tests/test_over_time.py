@@ -1,8 +1,8 @@
 """Checks for the *_over_time tools: the granularity enum, the overflow digest, the rollups.
 
 _check_granularity only bounds the bucket count, never the second (node/event_name)
-dimension, so an unfiltered call can fan out across every distinct value fleet-wide. Past
-_MAX_ROWS_UNFILTERED that series is swapped for per-dimension totals rather than returned.
+dimension, so a call can fan out across every distinct value fleet-wide. Past
+_RESPONSE_BUDGET_CHARS the series is cut to per-dimension totals plus the largest series that fit.
 
 Run: uv run python tests/test_over_time.py
 """
@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lens_mcp.server import (
     _CLIENT_ROLLUPS,
     _GRANULARITY_MINUTES,
+    _RESPONSE_BUDGET_CHARS,
     _check_granularity,
+    _json_chars,
     _rollup,
     _summarize_overflow,
     mcp,
@@ -36,40 +38,46 @@ def test_granularity_enums_match_the_sizes_the_server_can_serve():
         assert set(enum(name)) == set(_GRANULARITY_MINUTES) | set(_CLIENT_ROLLUPS), name
 
 
-def _oversized(rows_per_dim=1000):
+def _oversized(rows_per_dim=250):
+    # Each dimension's rows are ~13 KB of JSON: two fit in the budget, three don't.
     series = []
     for i in range(rows_per_dim):
-        series.append({"ts": f"t{i}", "event_name": "big", "count": 3, "calls": 2})
-        series.append({"ts": f"t{i}", "event_name": "small", "count": 1, "calls": 1})
-    series.append({"ts": "t0", "event_name": "rare", "count": 1, "calls": 1})
+        for name, count in (("big", 3), ("mid", 2), ("small", 1)):
+            series.append({"ts": f"t{i}", "event_name": name, "count": count, "calls": 1})
     return {"series": series, "other": "kept"}
 
 
-def test_unfiltered_overflow_becomes_ranked_totals():
-    out = _summarize_overflow(_oversized(), "", "event_types", "event_name", ("count", "calls"))
+def test_overflow_keeps_totals_and_the_largest_series_that_fit():
+    data = _oversized()
+    assert _json_chars(data["series"]) > _RESPONSE_BUDGET_CHARS
+    out = _summarize_overflow(data, "event_types", "event_name", ("count", "calls"))
 
-    assert "series" not in out and "TRUNCATED" in out and "event_types" in out["TRUNCATED"]
+    assert "TRUNCATED" in out and "event_types" in out["TRUNCATED"]
     assert out["other"] == "kept"  # non-series keys survive
-    assert [t["event_name"] for t in out["totals"]] == ["big", "small", "rare"]  # largest first
-    assert out["totals"][0] == {"event_name": "big", "buckets": 1000, "count": 3000, "calls": 2000}
+    assert [t["event_name"] for t in out["totals"]] == ["big", "mid", "small"]  # largest first
+    assert out["totals"][0] == {"event_name": "big", "buckets": 250, "count": 750, "calls": 250}
+    assert {r["event_name"] for r in out["series"]} == {"big", "mid"}  # a top-K: small doesn't fit
+    assert len(out["series"]) == 500  # every bucket of each kept dimension, none trimmed
+    assert _json_chars({k: v for k, v in out.items() if k != "TRUNCATED"}) <= _RESPONSE_BUDGET_CHARS
 
 
 def test_overflow_never_combines_percentiles():
     series = [{"node": "llm", "count": 10, "p90_ms": float(v)} for v in (500, 100, 900)] * 700
-    out = _summarize_overflow({"series": series}, "", "nodes", "node", ("count",), ("p90_ms",))
+    out = _summarize_overflow({"series": series}, "nodes", "node", ("count",), ("p90_ms",))
 
     assert out["totals"][0]["count"] == 21000
     assert out["totals"][0]["p90_ms_range"] == (100.0, 900.0)  # a range, not a fake mean
     assert "p90_ms" not in out["totals"][0]
+    # One node's 2100 rows alone are past the budget, so no series survives — and it says so.
+    assert out["series"] == []
+    assert "is empty" in out["TRUNCATED"]
 
 
-def test_overflow_digest_skipped_when_filtered_small_or_unrecognized():
-    big = _oversized()
-    assert _summarize_overflow(big, "big,small", "event_types", "event_name", ("count",)) is big
+def test_overflow_digest_skipped_when_small_or_unrecognized():
     small = {"series": [{"event_name": "a", "count": 1}]}
-    assert _summarize_overflow(small, "", "event_types", "event_name", ("count",)) is small
+    assert _summarize_overflow(small, "event_types", "event_name", ("count",)) is small
     for odd in ({}, {"series": "not-a-list"}):
-        assert _summarize_overflow(odd, "", "event_types", "event_name", ("count",)) is odd
+        assert _summarize_overflow(odd, "event_types", "event_name", ("count",)) is odd
 
 
 def test_rollup_1day_sums_exact_and_approx_across_hour_boundaries():
