@@ -24,6 +24,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
@@ -1748,9 +1749,11 @@ _MAX_BUCKETS = 800  # 30 days hourly (720) is a legitimate trend query; 5min ove
 def _check_granularity(granularity: str, time_range_minutes: int, time_from: str, time_to: str) -> None:
     """Refuse a window/granularity pair that would return tens of thousands of rows.
 
-    These endpoints return one row per (bucket, node), so 30 days at 5min is ~8600 buckets
-    times every node. Failing with the arithmetic shown beats either a silent truncation or
-    a response that blows the tool output limit.
+    Bounds buckets alone — these endpoints return one row per (bucket, node-or-event_name), so
+    30 days at 5min is ~8600 buckets times every distinct value, but this check cannot see that
+    second factor. See _summarize_overflow for the guard on that fan-out when the caller has
+    not named specific values. granularity here must be a real backend bucket size ("5min",
+    "15min" or "1hour") — a client-only value like "1day" must be resolved before this call.
     """
     if granularity not in _GRANULARITY_MINUTES:
         raise ValueError(
@@ -1771,6 +1774,81 @@ def _check_granularity(granularity: str, time_range_minutes: int, time_from: str
         )
 
 
+# Observed live: a single unfiltered hourly bucket returned ~80 distinct event_names
+# (2026-09-25 sample of event_counts_over_time) — buckets alone don't bound the response when
+# the fan-out dimension (node / event_name) is wide open. Measured on the actual row count
+# rather than a guessed fan-out factor, since cardinality varies by fleet and time.
+_MAX_ROWS_UNFILTERED = 2000
+
+
+def _summarize_overflow(
+    data: dict,
+    fan_out_filter: str,
+    fan_out_param: str,
+    dim_key: str,
+    sum_keys: tuple[str, ...],
+    range_keys: tuple[str, ...] = (),
+    caveat: str = "",
+) -> dict:
+    """Swap an oversized unfiltered series for one total per dim_key over the whole window.
+
+    The rows are already fetched, so a digest answers "which ones matter" at no extra cost,
+    where refusing would waste the fetch and force a blind retry. range_keys are non-additive
+    (percentiles), so they are reported as the [min, max] seen across buckets, never combined.
+    Skipped when fan_out_filter is set — a caller who named values chose that multiplier.
+    """
+    series = data.get("series")
+    if fan_out_filter or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
+        return data
+    totals: dict = {}
+    for row in series:
+        t = totals.setdefault(row.get(dim_key), {dim_key: row.get(dim_key), "buckets": 0})
+        t["buckets"] += 1
+        for k in sum_keys:
+            t[k] = t.get(k, 0) + (row.get(k) or 0)
+        for k in range_keys:
+            v = row.get(k)
+            if isinstance(v, (int, float)):
+                lo, hi = t.get(f"{k}_range", (v, v))
+                t[f"{k}_range"] = (round(min(lo, v), 1), round(max(hi, v), 1))
+    ranked = sorted(totals.values(), key=lambda t: t.get(sum_keys[0], 0), reverse=True)
+    return {
+        "TRUNCATED": (
+            f"{len(series)} rows with no {fan_out_param} filter is past the "
+            f"{_MAX_ROWS_UNFILTERED}-row budget, so the per-bucket series was replaced by one "
+            f"total per {dim_key} over the whole window, largest first.{caveat} For the time "
+            f"series, re-run with {fan_out_param}=<the {dim_key}s you care about>, or narrow "
+            f"the window."
+        ),
+        **{k: v for k, v in data.items() if k != "series"},
+        "totals": ranked,
+    }
+
+
+def _rollup_daily(series: list, dim_key: str, exact_key: str, approx_key: str) -> list:
+    """Collapse hourly buckets into calendar-day buckets for the client-only "1day" granularity.
+
+    exact_key (a plain occurrence count) sums correctly — an event belongs to exactly one hour.
+    approx_key (a distinct/affected-call count) is summed too but is only an upper bound: a call
+    whose activity spans an hour boundary is counted again in each hour it touched.
+    """
+    days: dict = {}
+    for row in series:
+        ts = row.get("ts") or ""
+        if len(ts) < 10:
+            raise RuntimeError(
+                f"Unexpected bucket shape from the backend (no parseable 'ts'): {row!r} — "
+                f"granularity=1day rollup cannot proceed. Retry with granularity=1hour."
+            )
+        key = (ts[:10], row.get(dim_key))
+        bucket = days.setdefault(
+            key, {"ts": ts[:10], dim_key: row.get(dim_key), exact_key: 0, approx_key: 0}
+        )
+        bucket[exact_key] += row.get(exact_key) or 0
+        bucket[approx_key] += row.get(approx_key) or 0
+    return [days[k] for k in sorted(days)]
+
+
 _RETENTION = {
     "mv": "aggregates retain 90 days — longer than the 30-day raw spans they summarise",
     "spans": "raw spans retain 30 days",
@@ -1781,7 +1859,7 @@ _RETENTION = {
 @mcp.tool(annotations=READ_ONLY)
 async def latency_over_time(
     ctx: Context,
-    granularity: str = "1hour",
+    granularity: Literal["5min", "15min", "1hour"] = "1hour",
     nodes: str = "",
     campaign_id: str = "",
     agent_config_id: str = "",
@@ -1805,9 +1883,13 @@ async def latency_over_time(
     30-day raw span window. Fleet trends stay answerable long after the spans
     that produced them have aged out.
 
+    Without nodes, a bucket fans out across every distinct node seen fleet-wide. Past a
+    row budget the response carries TRUNCATED and one `totals` entry per node for the
+    whole window instead of `series` — then re-run with nodes= for the time series.
+
     Args:
-        granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day.
-        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, which is a lot of rows.
+        granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "1day": percentiles aren't additive across buckets — event_counts_over_time / error_counts_over_time support it instead, since counts are.
+        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config.
         prompt_ref: Restrict to a prompt reference ID.
@@ -1827,6 +1909,11 @@ async def latency_over_time(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/timeseries", params=params)
+    data = _summarize_overflow(
+        data, nodes, "nodes", "node", ("count",), ("p50_ms", "p90_ms", "p95_ms", "p99_ms"),
+        caveat=" Percentiles can't be combined across buckets, so each p*_ms_range is the "
+        "[min, max] seen across them.",
+    )
     return _fmt({"retention": _RETENTION["mv"], **data})
 
 
@@ -1877,7 +1964,7 @@ async def latency_breakdown(
 async def event_counts_over_time(
     ctx: Context,
     event_types: str = "",
-    granularity: str = "1hour",
+    granularity: Literal["5min", "15min", "1hour", "1day"] = "1hour",
     campaign_id: str = "",
     agent_config_id: str = "",
     time_range_minutes: int = 360,
@@ -1894,17 +1981,23 @@ async def event_counts_over_time(
 
     Reads a materialized view retained for 90 DAYS.
 
+    Without event_types, a bucket fans out across every distinct event_name seen
+    fleet-wide (commonly 50-100+). Past a row budget the response carries TRUNCATED
+    and one `totals` entry per event_name for the whole window instead of `series` —
+    then re-run with event_types= for the time series.
+
     Args:
-        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all.
-        granularity: "5min", "15min" or "1hour" (default).
+        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all, summarized to totals past the row budget above.
+        granularity: "5min", "15min", "1hour" (default), or "1day" (sums 1hour buckets client-side — exact for count, an upper bound for calls; see the response's NOTE).
         campaign_id: Restrict to a campaign.
         agent_config_id: Restrict to an agent config.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
     """
-    _check_granularity(granularity, time_range_minutes, time_from, time_to)
-    params: dict = {"granularity": granularity}
+    backend_granularity = "1hour" if granularity == "1day" else granularity
+    _check_granularity(backend_granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": backend_granularity}
     if event_types:
         params["event_types"] = event_types
     if campaign_id:
@@ -1913,13 +2006,25 @@ async def event_counts_over_time(
         params["agent_id"] = agent_config_id
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/events", params=params)
+    if granularity == "1day" and isinstance(data.get("series"), list):
+        data["series"] = _rollup_daily(data["series"], "event_name", "count", "calls")
+        data["NOTE"] = (
+            "granularity=1day sums the underlying hourly buckets client-side: `count` is exact "
+            "(each event belongs to one hour), `calls` is an upper bound (a call whose activity "
+            "spans an hour boundary is counted again in each hour it touched)."
+        )
+    data = _summarize_overflow(
+        data, event_types, "event_types", "event_name", ("count", "calls"),
+        caveat=" `calls` totals are upper bounds (a call active in several buckets counts in "
+        "each)." + ("" if granularity == "1day" else ' granularity="1day" cuts rows 24x.'),
+    )
     return _fmt({"retention": _RETENTION["mv"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def error_counts_over_time(
     ctx: Context,
-    granularity: str = "1hour",
+    granularity: Literal["5min", "15min", "1hour", "1day"] = "1hour",
     nodes: str = "",
     campaign_id: str = "",
     prompt_ref: str = "",
@@ -1935,17 +2040,22 @@ async def error_counts_over_time(
 
     Reads a materialized view retained for 90 DAYS.
 
+    Without nodes, a bucket fans out across every distinct node seen fleet-wide. Past a
+    row budget the response carries TRUNCATED and one `totals` entry per node for the
+    whole window instead of `series` — then re-run with nodes= for the time series.
+
     Args:
-        granularity: "5min", "15min" or "1hour" (default).
-        nodes: Comma-separated node names to restrict to. Empty returns all.
+        granularity: "5min", "15min", "1hour" (default), or "1day" (sums 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE).
+        nodes: Comma-separated node names to restrict to. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
     """
-    _check_granularity(granularity, time_range_minutes, time_from, time_to)
-    params: dict = {"granularity": granularity}
+    backend_granularity = "1hour" if granularity == "1day" else granularity
+    _check_granularity(backend_granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": backend_granularity}
     if nodes:
         params["nodes"] = nodes
     if campaign_id:
@@ -1954,6 +2064,18 @@ async def error_counts_over_time(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/error-timeseries", params=params)
+    if granularity == "1day" and isinstance(data.get("series"), list):
+        data["series"] = _rollup_daily(data["series"], "node", "errors", "affected_calls")
+        data["NOTE"] = (
+            "granularity=1day sums the underlying hourly buckets client-side: `errors` is exact "
+            "(each error belongs to one hour), `affected_calls` is an upper bound (a call whose "
+            "activity spans an hour boundary is counted again in each hour it touched)."
+        )
+    data = _summarize_overflow(
+        data, nodes, "nodes", "node", ("errors", "affected_calls"),
+        caveat=" `affected_calls` totals are upper bounds (a call active in several buckets "
+        "counts in each)." + ("" if granularity == "1day" else ' granularity="1day" cuts rows 24x.'),
+    )
     return _fmt({"retention": _RETENTION["mv"], **data})
 
 
