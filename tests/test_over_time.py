@@ -120,6 +120,22 @@ def test_rollup_10min_and_30min_align_to_the_clock():
     ]
 
 
+def test_rollup_survives_a_null_dimension_beside_a_named_one():
+    series = [
+        {"ts": "2026-01-01T03:00:00", "node": None, "errors": 1, "affected_calls": 1},
+        {"ts": "2026-01-01T03:05:00", "node": "llm", "errors": 2, "affected_calls": 1},
+    ]
+    out = _rollup(series, "10min", "node", "errors", "affected_calls")
+    assert {r["node"]: r["errors"] for r in out} == {None: 1, "llm": 2}
+
+
+def test_rollup_days_are_utc_even_when_ts_carries_an_offset():
+    # 01:30 IST on 2 Jan is 20:00 UTC on 1 Jan.
+    series = [{"ts": "2026-01-02T01:30:00+05:30", "event_name": "a", "count": 4, "calls": 1}]
+    out = _rollup(series, "1day", "event_name", "count", "calls")
+    assert [(r["ts"], r["count"]) for r in out] == [("2026-01-01", 4)]
+
+
 def test_rollup_rejects_a_row_with_no_parseable_ts():
     for bad_row in ({"event_name": "a", "count": 1}, {"ts": "garbage", "event_name": "a"}):
         try:
@@ -138,6 +154,12 @@ def test_client_rollups_are_sized_on_the_rows_actually_fetched():
         raise AssertionError("expected the 5min fetch behind 10min to be refused")
     except ValueError as e:
         assert "fetched as 5min" in str(e)
+    # 40 days at 1day is 960 hourly fetches; nothing is coarser, so only a shorter window helps.
+    try:
+        _check_granularity("1day", 57600, "", "")
+        raise AssertionError("expected the 1hour fetch behind 1day to be refused")
+    except ValueError as e:
+        assert "coarser" not in str(e) and "shorter window" in str(e)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,8 @@ def test_structured_content_is_the_object_and_text_is_the_same_json():
 
     assert r.isError is False
     assert r.structuredContent == payload
-    assert json.loads(r.content[0].text) == payload  # text-only clients read identical JSON
+    # Text-only clients read the same JSON value; the bytes differ (non-ASCII is unescaped).
+    assert json.loads(r.content[0].text) == payload
 
 
 def test_full_series_bypasses_the_overflow_summary():
@@ -71,6 +72,13 @@ def test_full_series_bypasses_the_overflow_summary():
         "event_counts_over_time", {"full_series": True}, {"series": rows}
     ).structuredContent
     assert len(full["series"]) == 3000 and "TRUNCATED" not in full
+
+
+def test_rollup_without_a_series_list_errors_instead_of_mislabelling_rows():
+    rows = [{"ts": "2026-01-01T03:00:00", "event_name": "a", "count": 1, "calls": 1}]
+    r = _call("event_counts_over_time", {"granularity": "10min"}, {"rows": rows})
+    assert r.isError is True
+    assert "granularity=5min" in r.content[0].text
 
 
 def test_extraction_stats_enums_match_what_client_and_backend_accept():

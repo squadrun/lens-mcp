@@ -1793,10 +1793,11 @@ def _check_granularity(
     buckets = minutes / _GRANULARITY_MINUTES[backend]
     if buckets > _MAX_BUCKETS:
         fetched_as = f" (fetched as {backend} buckets)" if backend != granularity else ""
+        coarser = "" if granularity == "1day" else "a coarser granularity or "
         raise ValueError(
             f"{int(minutes)} minutes at {granularity} granularity{fetched_as} is "
-            f"~{int(buckets)} buckets per node, which will overflow the tool response. Use a "
-            f"coarser granularity or a shorter window (max ~{_MAX_BUCKETS} buckets)."
+            f"~{int(buckets)} buckets per node, which will overflow the tool response. Use "
+            f"{coarser}a shorter window (max ~{_MAX_BUCKETS} buckets)."
         )
     return backend
 
@@ -1858,6 +1859,7 @@ def _rollup(series: list, granularity: str, dim_key: str, exact_key: str, approx
     exact_key (a plain occurrence count) sums correctly — an event belongs to exactly one
     bucket. approx_key (a distinct/affected-call count) is summed too but is only an upper
     bound: a call whose activity spans a bucket boundary is counted again in each bucket.
+    Buckets are floored in UTC — the backend's naive ts is UTC — so a "1day" bucket is a UTC day.
     """
     source, size = _CLIENT_ROLLUPS[granularity]
     out: dict = {}
@@ -1870,6 +1872,8 @@ def _rollup(series: list, granularity: str, dim_key: str, exact_key: str, approx
                 f"granularity={granularity} rollup cannot proceed. Retry with "
                 f"granularity={source}."
             ) from None
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(UTC).replace(tzinfo=None)
         minute_of_day = ts.hour * 60 + ts.minute
         start = minute_of_day - minute_of_day % size
         start_ts = ts.replace(hour=start // 60, minute=start % 60, second=0, microsecond=0)
@@ -1880,13 +1884,26 @@ def _rollup(series: list, granularity: str, dim_key: str, exact_key: str, approx
         )
         bucket[exact_key] += row.get(exact_key) or 0
         bucket[approx_key] += row.get(approx_key) or 0
-    return [out[k] for k in sorted(out)]
+    # str() because a null dimension next to a named one would make the tuples incomparable.
+    return [out[k] for k in sorted(out, key=lambda k: (k[0], str(k[1])))]
 
 
-def _rollup_note(granularity: str, exact_key: str, approx_key: str) -> str:
+def _apply_rollup(
+    data: dict, granularity: str, dim_key: str, exact_key: str, approx_key: str
+) -> None:
+    """Replace data["series"] with its _rollup and add a NOTE; a no-op for backend sizes."""
+    if granularity not in _CLIENT_ROLLUPS:
+        return
     source = _CLIENT_ROLLUPS[granularity][0]
-    return (
-        f"granularity={granularity} sums the underlying {source} buckets client-side: "
+    if not isinstance(data.get("series"), list):
+        # Passing the rows through would label source-size buckets as the size asked for.
+        raise RuntimeError(
+            f"Unexpected response from the backend (no 'series' list) — granularity="
+            f"{granularity} rollup cannot proceed. Retry with granularity={source}."
+        )
+    data["series"] = _rollup(data["series"], granularity, dim_key, exact_key, approx_key)
+    data["NOTE"] = (
+        f"granularity={granularity} sums the underlying {source} buckets client-side, in UTC: "
         f"`{exact_key}` is exact (each one belongs to one {source} bucket), `{approx_key}` is an "
         f"upper bound (a call whose activity spans a {source} boundary is counted again in each "
         f"bucket it touched). The first and last buckets may cover only part of their span."
@@ -2041,7 +2058,7 @@ async def event_counts_over_time(
 
     Args:
         event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all, summarized to totals past the row budget above.
-        granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day", which sum 5min / 15min / 1hour buckets client-side — exact for count, an upper bound for calls; see the response's NOTE.
+        granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for count, an upper bound for calls; see the response's NOTE.
         campaign_id: Restrict to a campaign.
         agent_config_id: Restrict to an agent config.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
@@ -2059,9 +2076,7 @@ async def event_counts_over_time(
         params["agent_id"] = agent_config_id
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/events", params=params)
-    if granularity in _CLIENT_ROLLUPS and isinstance(data.get("series"), list):
-        data["series"] = _rollup(data["series"], granularity, "event_name", "count", "calls")
-        data["NOTE"] = _rollup_note(granularity, "count", "calls")
+    _apply_rollup(data, granularity, "event_name", "count", "calls")
     if not full_series:
         data = _summarize_overflow(
             data,
@@ -2101,7 +2116,7 @@ async def error_counts_over_time(
     whole window instead of `series` — then re-run with nodes= for the time series.
 
     Args:
-        granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day", which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
+        granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
         nodes: Comma-separated node names to restrict to. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
@@ -2120,9 +2135,7 @@ async def error_counts_over_time(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/error-timeseries", params=params)
-    if granularity in _CLIENT_ROLLUPS and isinstance(data.get("series"), list):
-        data["series"] = _rollup(data["series"], granularity, "node", "errors", "affected_calls")
-        data["NOTE"] = _rollup_note(granularity, "errors", "affected_calls")
+    _apply_rollup(data, granularity, "node", "errors", "affected_calls")
     if not full_series:
         data = _summarize_overflow(
             data,
