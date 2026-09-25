@@ -19,11 +19,14 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import tempfile
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
+from typing import Any, Literal
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
@@ -38,7 +41,7 @@ API_PREFIX = "/api/ext/v1"
 TIMEOUT = 30.0
 
 try:
-    _VERSION = __import__("importlib.metadata", fromlist=["version"]).version("lens-mcp")
+    _VERSION = version("lens-mcp")
 except Exception:
     _VERSION = "unknown"
 
@@ -66,7 +69,8 @@ def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> fl
             return None
     return None  # no explicit window → fail the cap closed (the request carries no time bound, so the guard must not treat it as a safe 60 min)
 
-_CALL_SID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9\-]+$")
+
+_CALL_SID_PATTERN = re.compile(r"^[a-zA-Z0-9\-]+$")
 
 
 def _sanitize_sid(sid: str) -> str:
@@ -74,6 +78,7 @@ def _sanitize_sid(sid: str) -> str:
     if not sid or not _CALL_SID_PATTERN.match(sid):
         raise ValueError(f"Invalid call SID: {sid!r}")
     return sid
+
 
 _TOKEN_CACHE_PATH = Path.home() / ".cache" / "lens-mcp" / "token.json"
 
@@ -100,11 +105,15 @@ def _save_cached_token(token: str, username: str, expires_at: str) -> None:
     try:
         _TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = _TOKEN_CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "token": token,
-            "username": username,
-            "expires_at": expires_at,
-        }))
+        tmp.write_text(
+            json.dumps(
+                {
+                    "token": token,
+                    "username": username,
+                    "expires_at": expires_at,
+                }
+            )
+        )
         tmp.chmod(0o600)
         tmp.rename(_TOKEN_CACHE_PATH)
     except Exception:
@@ -119,7 +128,7 @@ def _is_token_valid(token: str) -> bool:
         payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
         claims = json.loads(base64.urlsafe_b64decode(payload))
         exp = claims.get("exp", 0)
-        return datetime.now(timezone.utc).timestamp() < exp
+        return datetime.now(UTC).timestamp() < exp
     except Exception:
         return False
 
@@ -145,7 +154,7 @@ async def _device_flow_auth(client: httpx.AsyncClient) -> dict | None:
         expires_in = code_data.get("expires_in", 1800)
         max_polls = expires_in // interval
 
-        print(f"\n  Lens MCP: Google authentication required")
+        print("\n  Lens MCP: Google authentication required")
         print(f"  Go to: {verification_url}")
         print(f"  Enter code: {user_code}\n", flush=True)
 
@@ -165,14 +174,15 @@ async def _device_flow_auth(client: httpx.AsyncClient) -> dict | None:
                     continue
                 if "token" in data:
                     _save_cached_token(data["token"], data.get("username", ""), data["expires_at"])
-                    print(f"  Authenticated as: {data.get('email', data.get('username', ''))}\n", flush=True)
+                    print(
+                        f"  Authenticated as: {data.get('email', data.get('username', ''))}\n",
+                        flush=True,
+                    )
                     return {"Authorization": f"Bearer {data['token']}"}
             else:
                 detail = ""
-                try:
+                with suppress(Exception):
                     detail = resp.json().get("detail", "")
-                except Exception:
-                    pass
                 if detail:
                     print(f"  Auth failed: {resp.status_code} {detail}", flush=True)
                 break
@@ -200,10 +210,12 @@ async def _authenticate(client: httpx.AsyncClient) -> dict:
         "  uv --directory ~/.cache/lens-mcp/repo run lens-mcp auth"
     )
 
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     async with httpx.AsyncClient(
-        base_url=BASE_URL, timeout=TIMEOUT,
+        base_url=BASE_URL,
+        timeout=TIMEOUT,
     ) as client:
         yield {"client": client, "authenticated": False}
 
@@ -225,8 +237,10 @@ def _client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_context["client"]
 
 
-def _fmt(data: dict | list) -> str:
-    return json.dumps(data, indent=2, default=str)
+def _out(data: dict | list) -> dict[str, Any]:
+    """A tool result as an object, so FastMCP sends it as structuredContent plus the same JSON
+    as text. Returning a str instead publishes it as one escaped string under "result"."""
+    return data if isinstance(data, dict) else {"result": data}
 
 
 async def _ensure_auth(ctx: Context) -> None:
@@ -421,7 +435,7 @@ async def get_call_details(
     include_config: bool = False,
     sections: str = "",
     transcript_range: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Get details for a call — metadata, transcript, entities, and config.
 
     This is the primary 'what happened in this call' tool. Use it first when
@@ -457,9 +471,7 @@ async def get_call_details(
     wanted = [s.strip() for s in sections.split(",") if s.strip()]
     unknown = [s for s in wanted if s not in _DETAIL_SECTIONS]
     if unknown:
-        raise ValueError(
-            f"Unknown section(s) {unknown}. Valid: {', '.join(_DETAIL_SECTIONS)}"
-        )
+        raise ValueError(f"Unknown section(s) {unknown}. Valid: {', '.join(_DETAIL_SECTIONS)}")
 
     params = {}
     if not (include_config or "config" in wanted):
@@ -485,11 +497,11 @@ async def get_call_details(
 
     if wanted:
         data = {k: v for k, v in data.items() if k in wanted}
-    return _fmt(data)
+    return _out(data)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_transcript(call_sid: str, ctx: Context) -> str:
+async def get_call_transcript(call_sid: str, ctx: Context) -> dict[str, Any]:
     """Get the full conversation transcript for a call.
 
     NOTE: get_call_details already includes the transcript. Only use this
@@ -501,11 +513,11 @@ async def get_call_transcript(call_sid: str, ctx: Context) -> str:
         call_sid: The call SID.
     """
     call_sid = _sanitize_sid(call_sid)
-    return _fmt(await _get(ctx, f"/call/{call_sid}/transcript"))
+    return _out(await _get(ctx, f"/call/{call_sid}/transcript"))
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_prompt(call_sids: str, ctx: Context) -> str:
+async def get_call_prompt(call_sids: str, ctx: Context) -> dict[str, Any]:
     """Get the rendered (interpolated) system prompt used for one or more calls.
 
     This is the actual final prompt sent to the LLM — lead details and custom
@@ -538,11 +550,11 @@ async def get_call_prompt(call_sids: str, ctx: Context) -> str:
             return {"call_id": sid, "error": f"{type(e).__name__}: {e}"}
 
     results = await asyncio.gather(*(fetch(s) for s in sids))
-    return _fmt(results[0] if len(results) == 1 else {"prompts": list(results)})
+    return _out(results[0] if len(results) == 1 else {"prompts": list(results)})
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_entity_prompt(call_sids: str, ctx: Context) -> str:
+async def get_entity_prompt(call_sids: str, ctx: Context) -> dict[str, Any]:
     """Get the rendered entity-extraction prompt (system + user) for one or more calls.
 
     This is the extraction-side counterpart to get_call_prompt:
@@ -580,7 +592,7 @@ async def get_entity_prompt(call_sids: str, ctx: Context) -> str:
             return {"call_id": sid, "error": f"{type(e).__name__}: {e}"}
 
     results = await asyncio.gather(*(fetch(s) for s in sids))
-    return _fmt(results[0] if len(results) == 1 else {"prompts": list(results)})
+    return _out(results[0] if len(results) == 1 else {"prompts": list(results)})
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -591,7 +603,7 @@ async def get_call_spans(
     phase: str = "",
     limit: int = 500,
     offset: int = 0,
-) -> str:
+) -> dict[str, Any]:
     """Get structured instrumentation spans and events for a call.
 
     Returns the latency waterfall: LLM/STT/TTS spans with timing,
@@ -635,7 +647,7 @@ async def get_call_spans(
             ),
             **data,
         }
-    return _fmt(data)
+    return _out(data)
 
 
 # ── Aggregation (pages the row cap away, returns statistics not rows) ──
@@ -750,7 +762,7 @@ def _parse_metric(metric: str) -> tuple[str, str]:
             raise ValueError('metric "metadata:" needs a key, e.g. "metadata:prompt_tokens"')
         return key, ""
     raise ValueError(
-        f"Unknown metric {metric!r} — use \"value_ms\" or \"metadata:<key>\" "
+        f'Unknown metric {metric!r} — use "value_ms" or "metadata:<key>" '
         f'(e.g. "metadata:prompt_tokens")'
     )
 
@@ -799,7 +811,9 @@ def _grouper(group_by: str):
     )
 
 
-def _aggregate(spans: list[dict], pcts: list[float], group_by: str, metric: str = "value_ms") -> dict:
+def _aggregate(
+    spans: list[dict], pcts: list[float], group_by: str, metric: str = "value_ms"
+) -> dict:
     """Reduce spans to statistics. Spans carrying no value for the metric are counted, never measured."""
     key, suffix = _parse_metric(metric)
     measured = [(s, v) for s in spans if (v := _metric_value(s, key)) is not None]
@@ -855,7 +869,7 @@ async def aggregate_spans(
     group_by: str = "",
     percentiles: str = "50,90,99",
     metric: str = "value_ms",
-) -> str:
+) -> dict[str, Any]:
     """Compute statistics over a call's spans — server-paged, never truncated.
 
     USE THIS INSTEAD OF get_call_spans WHENEVER YOU WANT A NUMBER. It pages past
@@ -915,7 +929,7 @@ async def aggregate_spans(
             f"Stopped after {_MAX_SPAN_PAGES * _SPAN_PAGE_SIZE} spans — statistics "
             f"cover only that prefix of the call. Narrow with node/phase and re-run."
         )
-    return _fmt(out)
+    return _out(out)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -937,7 +951,7 @@ async def aggregate_calls(
     percentiles: str = "50,90",
     max_calls: int = 20,
     sort_by: str = "p90",
-) -> str:
+) -> dict[str, Any]:
     """Compare one latency metric across a COHORT of calls — "is it this call or the fleet?".
 
     The follow-up question after aggregate_spans finds a slow call. Selects calls
@@ -1025,7 +1039,9 @@ async def aggregate_calls(
     listing = await _get(ctx, "/calls", params=params)
     calls = listing.get("calls", [])
     if not calls:
-        return _fmt({"calls_matched": 0, "note": "No calls matched the filters — widen the time window."})
+        return _out(
+            {"calls_matched": 0, "note": "No calls matched the filters — widen the time window."}
+        )
 
     sem = asyncio.Semaphore(_COHORT_CONCURRENCY)
 
@@ -1095,7 +1111,7 @@ async def aggregate_calls(
             f"recent matching calls, not the full population. Narrow the time window to "
             f"make the sample representative."
         )
-    return _fmt(out)
+    return _out(out)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1106,7 +1122,7 @@ async def get_call_trace_logs(
     logger_name: str = "",
     level: str = "",
     limit: int = 50,
-) -> str:
+) -> dict[str, Any]:
     """Query trace logs via ClickHouse — before calling this, check:
 
     1. Have you already called download_trace_logs for this call_sid?
@@ -1144,11 +1160,11 @@ async def get_call_trace_logs(
         params["logger_name"] = logger_name
     if level:
         params["level"] = level
-    return _fmt(await _get(ctx, f"/call/{call_sid}/traces", params=params))
+    return _out(await _get(ctx, f"/call/{call_sid}/traces", params=params))
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_entities(call_sid: str, ctx: Context) -> str:
+async def get_call_entities(call_sid: str, ctx: Context) -> dict[str, Any]:
     """Get entity extraction results for a call.
 
     Returns extracted entities (outcome, answers like call_outcome,
@@ -1158,11 +1174,11 @@ async def get_call_entities(call_sid: str, ctx: Context) -> str:
         call_sid: The call SID.
     """
     call_sid = _sanitize_sid(call_sid)
-    return _fmt(await _get(ctx, f"/call/{call_sid}/entities"))
+    return _out(await _get(ctx, f"/call/{call_sid}/entities"))
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_context(call_sid: str, ctx: Context) -> str:
+async def get_call_context(call_sid: str, ctx: Context) -> dict[str, Any]:
     """Get tool call details and pipeline summaries for a call.
 
     Returns structured tool call records (with args, results, durations)
@@ -1172,11 +1188,11 @@ async def get_call_context(call_sid: str, ctx: Context) -> str:
         call_sid: The call SID.
     """
     call_sid = _sanitize_sid(call_sid)
-    return _fmt(await _get(ctx, f"/call/{call_sid}/context"))
+    return _out(await _get(ctx, f"/call/{call_sid}/context"))
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_lead_details(call_sid: str, ctx: Context) -> str:
+async def get_lead_details(call_sid: str, ctx: Context) -> dict[str, Any]:
     """Get lead details for a call — resolved lead data and custom variables side by side.
 
     Returns the lead name/identity as resolved at call start (from Redis
@@ -1193,7 +1209,7 @@ async def get_lead_details(call_sid: str, ctx: Context) -> str:
         call_sid: The call SID.
     """
     call_sid = _sanitize_sid(call_sid)
-    return _fmt(await _get(ctx, f"/call/{call_sid}/lead-details"))
+    return _out(await _get(ctx, f"/call/{call_sid}/lead-details"))
 
 
 # ── Trace log download (for multi-grep in Claude Code) ─────────────────
@@ -1220,7 +1236,8 @@ async def _download_logs(
         filepath = os.path.join(scratchpad, f"{sid}_{file_suffix}.log")
 
         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-            line_count = sum(1 for _ in open(filepath))
+            with open(filepath) as f:
+                line_count = sum(1 for _ in f)
             return f"{sid}: already downloaded ({line_count} lines) -> {filepath}"
 
         total_lines = 0
@@ -1234,7 +1251,9 @@ async def _download_logs(
                     offset = 0
                     for _ in range(max_batches):
                         data = await _get(
-                            ctx, f"/call/{sid}/{endpoint}", params={"limit": batch_size, "offset": offset}
+                            ctx,
+                            f"/call/{sid}/{endpoint}",
+                            params={"limit": batch_size, "offset": offset},
                         )
                         traces = data.get("traces", [])
                         if not traces:
@@ -1467,7 +1486,7 @@ async def search_spans(
     time_from: str = "",
     time_to: str = "",
     limit: int = 50,
-) -> str:
+) -> dict[str, Any]:
     """Search structured spans across all calls using indexed columns.
 
     THIS IS THE PRIMARY SEARCH TOOL. Prefer structured filters (node, level,
@@ -1575,7 +1594,7 @@ async def search_spans(
             ),
             **data,
         }
-    return _fmt(data)
+    return _out(data)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1595,7 +1614,7 @@ async def list_calls(
     start_time_from: str = "",
     start_time_to: str = "",
     limit: int = 20,
-) -> str:
+) -> dict[str, Any]:
     """List calls from call_metadata with structured filters.
 
     Queries the call_metadata table (one row per call, ReplacingMergeTree).
@@ -1649,7 +1668,7 @@ async def list_calls(
         params["time_range_minutes"] = min(time_range_minutes, 10080)
     if start_time_to:
         params["start_time_to"] = start_time_to
-    return _fmt(await _get(ctx, "/calls", params=params))
+    return _out(await _get(ctx, "/calls", params=params))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1665,7 +1684,7 @@ async def count_spans(
     time_range_minutes: int = 60,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Count matching spans without returning row data.
 
     Use this when someone asks "how many?" — returns the exact count and
@@ -1705,7 +1724,7 @@ async def count_spans(
         params["time_range_minutes"] = time_range_minutes
     if time_to:
         params["time_to"] = time_to
-    return _fmt(await _get(ctx, "/search/count", params=params))
+    return _out(await _get(ctx, "/search/count", params=params))
 
 
 # ── Fleet aggregation (server-side, one hop instead of a sweep) ────────
@@ -1741,34 +1760,166 @@ async def _get_new_endpoint(ctx: Context, path: str, params: dict, needs: str) -
         raise
 
 
-_GRANULARITY_MINUTES = {"5min": 5, "15min": 15, "1hour": 60}
+_GRANULARITY_MINUTES = {"5min": 5, "15min": 15, "1hour": 60}  # all the backend accepts
+# Sizes the backend lacks, built by summing its buckets: name -> (source size, minutes).
+# Each divides an hour or a day evenly, so rolled-up buckets start on :00/:10/:30 or midnight.
+_CLIENT_ROLLUPS = {"10min": ("5min", 10), "30min": ("15min", 30), "1day": ("1hour", 1440)}
 _MAX_BUCKETS = 800  # 30 days hourly (720) is a legitimate trend query; 5min over days is not
 
 
-def _check_granularity(granularity: str, time_range_minutes: int, time_from: str, time_to: str) -> None:
-    """Refuse a window/granularity pair that would return tens of thousands of rows.
+def _check_granularity(
+    granularity: str, time_range_minutes: int, time_from: str, time_to: str
+) -> str:
+    """Refuse a window/granularity pair that would return tens of thousands of rows, and return
+    the backend bucket size to request.
 
-    These endpoints return one row per (bucket, node), so 30 days at 5min is ~8600 buckets
-    times every node. Failing with the arithmetic shown beats either a silent truncation or
-    a response that blows the tool output limit.
+    A client-only size (_CLIENT_ROLLUPS) is fetched at its source size and summed afterwards,
+    so it is sized on the finer rows actually fetched. Bounds buckets alone — these endpoints
+    return one row per (bucket, node-or-event_name), so 30 days at 5min is ~8600 buckets times
+    every distinct value, but this check cannot see that second factor. See _summarize_overflow
+    for the guard on that fan-out when the caller has not named specific values.
     """
-    if granularity not in _GRANULARITY_MINUTES:
+    backend = _CLIENT_ROLLUPS[granularity][0] if granularity in _CLIENT_ROLLUPS else granularity
+    if backend not in _GRANULARITY_MINUTES:
         raise ValueError(
             f"granularity must be one of {sorted(_GRANULARITY_MINUTES)}, got {granularity!r}"
         )
     if time_from:
         minutes = _window_minutes(0, time_from, time_to)
         if minutes is None:
-            return  # open-ended or unparseable explicit window — cannot size, caller's choice
+            return backend  # open-ended or unparseable explicit window — cannot size
     else:
         minutes = time_range_minutes
-    buckets = minutes / _GRANULARITY_MINUTES[granularity]
+    buckets = minutes / _GRANULARITY_MINUTES[backend]
     if buckets > _MAX_BUCKETS:
+        fetched_as = f" (fetched as {backend} buckets)" if backend != granularity else ""
+        coarser = "" if granularity == "1day" else "a coarser granularity or "
         raise ValueError(
-            f"{int(minutes)} minutes at {granularity} granularity is ~{int(buckets)} "
-            f"buckets per node, which will overflow the tool response. Use a coarser "
-            f"granularity or a shorter window (max ~{_MAX_BUCKETS} buckets)."
+            f"{int(minutes)} minutes at {granularity} granularity{fetched_as} is "
+            f"~{int(buckets)} buckets per node, which will overflow the tool response. Use "
+            f"{coarser}a shorter window (max ~{_MAX_BUCKETS} buckets)."
         )
+    return backend
+
+
+# Observed live: a single unfiltered hourly bucket returned ~80 distinct event_names
+# (2026-09-25 sample of event_counts_over_time) — buckets alone don't bound the response when
+# the fan-out dimension (node / event_name) is wide open. Measured on the actual row count
+# rather than a guessed fan-out factor, since cardinality varies by fleet and time.
+_MAX_ROWS_UNFILTERED = 2000
+
+
+def _summarize_overflow(
+    data: dict,
+    fan_out_filter: str,
+    fan_out_param: str,
+    dim_key: str,
+    sum_keys: tuple[str, ...],
+    range_keys: tuple[str, ...] = (),
+    caveat: str = "",
+) -> dict:
+    """Swap an oversized unfiltered series for one total per dim_key over the whole window.
+
+    The rows are already fetched, so a digest answers "which ones matter" at no extra cost,
+    where refusing would waste the fetch and force a blind retry. range_keys are non-additive
+    (percentiles), so they are reported as the [min, max] seen across buckets, never combined.
+    Skipped when fan_out_filter is set — a caller who named values chose that multiplier.
+    """
+    series = data.get("series")
+    if fan_out_filter or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
+        return data
+    totals: dict = {}
+    for row in series:
+        t = totals.setdefault(row.get(dim_key), {dim_key: row.get(dim_key), "buckets": 0})
+        t["buckets"] += 1
+        for k in sum_keys:
+            t[k] = t.get(k, 0) + (row.get(k) or 0)
+        for k in range_keys:
+            v = row.get(k)
+            if isinstance(v, (int, float)):
+                lo, hi = t.get(f"{k}_range", (v, v))
+                t[f"{k}_range"] = (round(min(lo, v), 1), round(max(hi, v), 1))
+    ranked = sorted(totals.values(), key=lambda t: t.get(sum_keys[0], 0), reverse=True)
+    return {
+        "TRUNCATED": (
+            f"{len(series)} rows with no {fan_out_param} filter is past the "
+            f"{_MAX_ROWS_UNFILTERED}-row budget, so the per-bucket series was replaced by one "
+            f"total per {dim_key} over the whole window, largest first.{caveat} For the time "
+            f"series, re-run with {fan_out_param}=<the {dim_key}s you care about>, narrow the "
+            f"window, or pass full_series=true for every row regardless of size."
+        ),
+        **{k: v for k, v in data.items() if k != "series"},
+        "totals": ranked,
+    }
+
+
+def _rollup(series: list, granularity: str, dim_key: str, exact_key: str, approx_key: str) -> list:
+    """Sum backend buckets into a client-only granularity from _CLIENT_ROLLUPS.
+
+    exact_key (a plain occurrence count) sums correctly — an event belongs to exactly one
+    bucket. approx_key (a distinct/affected-call count) is summed too but is only an upper
+    bound: a call whose activity spans a bucket boundary is counted again in each bucket.
+    Buckets are floored in UTC — the backend's naive ts is UTC — so a "1day" bucket is a UTC day.
+    """
+    source, size = _CLIENT_ROLLUPS[granularity]
+    out: dict = {}
+    for row in series:
+        try:
+            ts = datetime.fromisoformat(row["ts"])
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError(
+                f"Unexpected bucket shape from the backend (no parseable 'ts'): {row!r} — "
+                f"granularity={granularity} rollup cannot proceed. Retry with "
+                f"granularity={source}."
+            ) from None
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(UTC).replace(tzinfo=None)
+        minute_of_day = ts.hour * 60 + ts.minute
+        start = minute_of_day - minute_of_day % size
+        start_ts = ts.replace(hour=start // 60, minute=start % 60, second=0, microsecond=0)
+        label = start_ts.date().isoformat() if granularity == "1day" else start_ts.isoformat()
+        bucket = out.setdefault(
+            (label, row.get(dim_key)),
+            {"ts": label, dim_key: row.get(dim_key), exact_key: 0, approx_key: 0},
+        )
+        bucket[exact_key] += row.get(exact_key) or 0
+        bucket[approx_key] += row.get(approx_key) or 0
+    # str() because a null dimension next to a named one would make the tuples incomparable.
+    return [out[k] for k in sorted(out, key=lambda k: (k[0], str(k[1])))]
+
+
+def _apply_rollup(
+    data: dict, granularity: str, dim_key: str, exact_key: str, approx_key: str
+) -> dict:
+    """data with its series replaced by _rollup and a NOTE added; unchanged for backend sizes."""
+    if granularity not in _CLIENT_ROLLUPS:
+        return data
+    source = _CLIENT_ROLLUPS[granularity][0]
+    if not isinstance(data.get("series"), list):
+        # Passing the rows through would label source-size buckets as the size asked for.
+        raise RuntimeError(
+            f"Unexpected response from the backend (no 'series' list) — granularity="
+            f"{granularity} rollup cannot proceed. Retry with granularity={source}."
+        )
+    return {
+        **data,
+        "series": _rollup(data["series"], granularity, dim_key, exact_key, approx_key),
+        "NOTE": (
+            f"granularity={granularity} sums the underlying {source} buckets client-side, in UTC: "
+            f"`{exact_key}` is exact (each one belongs to one {source} bucket), `{approx_key}` is "
+            f"an upper bound (a call whose activity spans a {source} boundary is counted again in "
+            f"each bucket it touched). The first and last buckets may cover only part of their span."
+        ),
+    }
+
+
+def _upper_bound_caveat(approx_key: str, granularity: str) -> str:
+    """The _summarize_overflow caveat for the count tools, whose approx_key sums to an upper bound."""
+    day_hint = "" if granularity == "1day" else ' granularity="1day" gives one row per day.'
+    return (
+        f" `{approx_key}` totals are upper bounds (a call active in several buckets counts in "
+        f"each).{day_hint}"
+    )
 
 
 _RETENTION = {
@@ -1781,7 +1932,7 @@ _RETENTION = {
 @mcp.tool(annotations=READ_ONLY)
 async def latency_over_time(
     ctx: Context,
-    granularity: str = "1hour",
+    granularity: Literal["5min", "15min", "1hour"] = "1hour",
     nodes: str = "",
     campaign_id: str = "",
     agent_config_id: str = "",
@@ -1789,7 +1940,8 @@ async def latency_over_time(
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+    full_series: bool = False,
+) -> dict[str, Any]:
     """Latency percentiles per node per time bucket — the fleet trend in one call.
 
     USE THIS INSTEAD OF sweeping search_spans across time windows. Returns
@@ -1805,15 +1957,20 @@ async def latency_over_time(
     30-day raw span window. Fleet trends stay answerable long after the spans
     that produced them have aged out.
 
+    Without nodes, a bucket fans out across every distinct node seen fleet-wide. Past a
+    row budget the response carries TRUNCATED and one `totals` entry per node for the
+    whole window instead of `series` — then re-run with nodes= for the time series.
+
     Args:
-        granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day.
-        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, which is a lot of rows.
+        granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "10min" / "30min" / "1day": the backend has only these three, and percentiles can't be summed into coarser buckets — event_counts_over_time / error_counts_over_time offer them, since counts can.
+        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
+        full_series: Return every per-bucket row even past the row budget, instead of the totals summary.
     """
     _check_granularity(granularity, time_range_minutes, time_from, time_to)
     params: dict = {"granularity": granularity}
@@ -1827,7 +1984,18 @@ async def latency_over_time(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/timeseries", params=params)
-    return _fmt({"retention": _RETENTION["mv"], **data})
+    if not full_series:
+        data = _summarize_overflow(
+            data,
+            nodes,
+            "nodes",
+            "node",
+            ("count",),
+            ("p50_ms", "p90_ms", "p95_ms", "p99_ms"),
+            caveat=" Percentiles can't be combined across buckets, so each p*_ms_range is the "
+            "[min, max] seen across them.",
+        )
+    return _out({"retention": _RETENTION["mv"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1839,7 +2007,7 @@ async def latency_breakdown(
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Percentiles per node and phase across the whole fleet — the stage attribution table.
 
     One call replaces walking search_spans through llm. / stt. / tts. /
@@ -1870,20 +2038,21 @@ async def latency_breakdown(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/breakdown", params=params)
-    return _fmt({"retention": _RETENTION["spans"], **data})
+    return _out({"retention": _RETENTION["spans"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def event_counts_over_time(
     ctx: Context,
     event_types: str = "",
-    granularity: str = "1hour",
+    granularity: Literal["5min", "10min", "15min", "30min", "1hour", "1day"] = "1hour",
     campaign_id: str = "",
     agent_config_id: str = "",
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+    full_series: bool = False,
+) -> dict[str, Any]:
     """Event counts per event_name per time bucket, with affected-call counts.
 
     USE THIS INSTEAD OF calling count_spans once per event name or once per
@@ -1894,17 +2063,23 @@ async def event_counts_over_time(
 
     Reads a materialized view retained for 90 DAYS.
 
+    Without event_types, a bucket fans out across every distinct event_name seen
+    fleet-wide (commonly 50-100+). Past a row budget the response carries TRUNCATED
+    and one `totals` entry per event_name for the whole window instead of `series` —
+    then re-run with event_types= for the time series.
+
     Args:
-        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all.
-        granularity: "5min", "15min" or "1hour" (default).
+        event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all, summarized to totals past the row budget above.
+        granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for count, an upper bound for calls; see the response's NOTE.
         campaign_id: Restrict to a campaign.
         agent_config_id: Restrict to an agent config.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
+        full_series: Return every per-bucket row even past the row budget, instead of the totals summary.
     """
-    _check_granularity(granularity, time_range_minutes, time_from, time_to)
-    params: dict = {"granularity": granularity}
+    backend_granularity = _check_granularity(granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": backend_granularity}
     if event_types:
         params["event_types"] = event_types
     if campaign_id:
@@ -1913,20 +2088,31 @@ async def event_counts_over_time(
         params["agent_id"] = agent_config_id
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/events", params=params)
-    return _fmt({"retention": _RETENTION["mv"], **data})
+    data = _apply_rollup(data, granularity, "event_name", "count", "calls")
+    if not full_series:
+        data = _summarize_overflow(
+            data,
+            event_types,
+            "event_types",
+            "event_name",
+            ("count", "calls"),
+            caveat=_upper_bound_caveat("calls", granularity),
+        )
+    return _out({"retention": _RETENTION["mv"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def error_counts_over_time(
     ctx: Context,
-    granularity: str = "1hour",
+    granularity: Literal["5min", "10min", "15min", "30min", "1hour", "1day"] = "1hour",
     nodes: str = "",
     campaign_id: str = "",
     prompt_ref: str = "",
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+    full_series: bool = False,
+) -> dict[str, Any]:
     """Error span counts per node per time bucket, with affected-call counts.
 
     The error counterpart to latency_over_time. Use it to find WHEN a provider
@@ -1935,17 +2121,22 @@ async def error_counts_over_time(
 
     Reads a materialized view retained for 90 DAYS.
 
+    Without nodes, a bucket fans out across every distinct node seen fleet-wide. Past a
+    row budget the response carries TRUNCATED and one `totals` entry per node for the
+    whole window instead of `series` — then re-run with nodes= for the time series.
+
     Args:
-        granularity: "5min", "15min" or "1hour" (default).
-        nodes: Comma-separated node names to restrict to. Empty returns all.
+        granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
+        nodes: Comma-separated node names to restrict to. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
+        full_series: Return every per-bucket row even past the row budget, instead of the totals summary.
     """
-    _check_granularity(granularity, time_range_minutes, time_from, time_to)
-    params: dict = {"granularity": granularity}
+    backend_granularity = _check_granularity(granularity, time_range_minutes, time_from, time_to)
+    params: dict = {"granularity": backend_granularity}
     if nodes:
         params["nodes"] = nodes
     if campaign_id:
@@ -1954,7 +2145,17 @@ async def error_counts_over_time(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/error-timeseries", params=params)
-    return _fmt({"retention": _RETENTION["mv"], **data})
+    data = _apply_rollup(data, granularity, "node", "errors", "affected_calls")
+    if not full_series:
+        data = _summarize_overflow(
+            data,
+            nodes,
+            "nodes",
+            "node",
+            ("errors", "affected_calls"),
+            caveat=_upper_bound_caveat("affected_calls", granularity),
+        )
+    return _out({"retention": _RETENTION["mv"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1965,7 +2166,7 @@ async def tool_outcomes(
     time_range_minutes: int = 360,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Success/failure/timeout counts and durations per bot tool function.
 
     Answers "which tool is failing or slow" across the fleet in one call —
@@ -1985,7 +2186,7 @@ async def tool_outcomes(
     if prompt_ref:
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
-    return _fmt(await _get(ctx, "/observability/tools", params=params))
+    return _out(await _get(ctx, "/observability/tools", params=params))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2005,7 +2206,7 @@ async def slowest_calls(
     time_from: str = "",
     time_to: str = "",
     limit: int = 50,
-) -> str:
+) -> dict[str, Any]:
     """Rank every call in a window by a latency percentile — one query, whole population.
 
     The fleet-wide answer to "which calls are worst, and is this call unusual".
@@ -2057,22 +2258,29 @@ async def slowest_calls(
         "min_spans": max(min_spans, 1),
         "limit": min(max(limit, 1), 500),
     }
-    for key, val in (("phase", phase), ("event_name", event_name), ("campaign_id", campaign_id),
-                     ("agent_config_id", agent_config_id), ("prompt_ref", prompt_ref)):
+    for key, val in (
+        ("phase", phase),
+        ("event_name", event_name),
+        ("campaign_id", campaign_id),
+        ("agent_config_id", agent_config_id),
+        ("prompt_ref", prompt_ref),
+    ):
         if val:
             params[key] = val
     if metric and metric != "value_ms":
         params["metric"] = metric
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get_new_endpoint(
-        ctx, "/observability/call-percentiles", params,
+        ctx,
+        "/observability/call-percentiles",
+        params,
         needs="squadrun/lens#56 (use aggregate_calls meanwhile)",
     )
-    return _fmt({"retention": _RETENTION["spans"], **data})
+    return _out({"retention": _RETENTION["spans"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def list_filter_values(ctx: Context) -> str:
+async def list_filter_values(ctx: Context) -> dict[str, Any]:
     """List the values you can actually filter on — campaigns, models, providers, agents.
 
     CALL THIS BEFORE GUESSING a campaign_id, llm_model, stt_provider or
@@ -2088,7 +2296,7 @@ async def list_filter_values(ctx: Context) -> str:
     Feeds the filters on list_calls, search_spans, slowest_calls, latency_over_time
     and latency_breakdown.
     """
-    return _fmt(await _get(ctx, "/observability/filters"))
+    return _out(await _get(ctx, "/observability/filters"))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2102,7 +2310,7 @@ async def search_trace_logs(
     campaign_id: str = "",
     limit: int = 50,
     offset: int = 0,
-) -> str:
+) -> dict[str, Any]:
     """Free-text search across raw log bodies for ALL calls — not one call at a time.
 
     This is the fleet-wide log grep. Use it to find which calls contain a log
@@ -2161,11 +2369,11 @@ async def search_trace_logs(
         params["campaign_id"] = campaign_id
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/search/traces", params=params)
-    return _fmt({"retention": _RETENTION["traces"], **data})
+    return _out({"retention": _RETENTION["traces"], **data})
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_call_config(call_sid: str, ctx: Context) -> str:
+async def get_call_config(call_sid: str, ctx: Context) -> dict[str, Any]:
     """Get the agent config JSON for a call, on its own.
 
     Same data as get_call_details(sections="config"), but without fetching the
@@ -2178,24 +2386,28 @@ async def get_call_config(call_sid: str, ctx: Context) -> str:
         call_sid: The call SID.
     """
     call_sid = _sanitize_sid(call_sid)
-    return _fmt(await _get_new_endpoint(
-        ctx, f"/call/{call_sid}/config", {},
-        needs='squadrun/lens#56 (use get_call_details(sections="config") meanwhile)',
-    ))
+    return _out(
+        await _get_new_endpoint(
+            ctx,
+            f"/call/{call_sid}/config",
+            {},
+            needs='squadrun/lens#56 (use get_call_details(sections="config") meanwhile)',
+        )
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_extraction_stats(
     ctx: Context,
-    view: str = "outcomes",
+    view: Literal["outcomes", "latency", "models", "filters"] = "outcomes",
     customer: str = "",
     campaign_id: str = "",
     voice_mission_id: str = "",
-    granularity: str = "1hour",
+    granularity: Literal["5min", "15min", "1hour"] = "1hour",
     time_range_minutes: int = 1440,
     time_from: str = "",
     time_to: str = "",
-) -> str:
+) -> dict[str, Any]:
     """Entity-extraction (post-call) stats across the fleet — outcomes, latency, models.
 
     The extraction-side counterpart to latency_over_time. Answers "what fraction
@@ -2218,25 +2430,26 @@ async def get_extraction_stats(
         "models": "/observability/ee-models",
         "filters": "/observability/ee-filters",
     }
-    if view not in endpoints:
-        raise ValueError(f"view must be one of {sorted(endpoints)}, got {view!r}")
     params: dict = {}
     if view in ("outcomes", "latency"):
         params["granularity"] = granularity
     if view != "filters":
-        for key, val in (("customer", customer), ("campaign_id", campaign_id),
-                         ("voice_mission_id", voice_mission_id)):
+        for key, val in (
+            ("customer", customer),
+            ("campaign_id", campaign_id),
+            ("voice_mission_id", voice_mission_id),
+        ):
             if val:
                 params[key] = val
     _window(params, time_range_minutes, time_from, time_to)
-    return _fmt(await _get(ctx, endpoints[view], params=params))
+    return _out(await _get(ctx, endpoints[view], params=params))
 
 
 # ── Comparison tools ───────────────────────────────────────────────────
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def compare_calls(call_sids: str, ctx: Context) -> str:
+async def compare_calls(call_sids: str, ctx: Context) -> dict[str, Any]:
     """Compare 2-10 calls side by side — metadata and timing spans.
 
     Returns metadata (duration, outcome, providers, errors) and spans
@@ -2247,13 +2460,11 @@ async def compare_calls(call_sids: str, ctx: Context) -> str:
         call_sids: Comma-separated call SIDs (e.g. "abc123,def456,ghi789").
     """
     sids = [_sanitize_sid(s) for s in call_sids.split(",") if s.strip()]
-    return _fmt(await _get(ctx, "/compare", params={"call_ids": ",".join(sids)}))
+    return _out(await _get(ctx, "/compare", params={"call_ids": ",".join(sids)}))
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def compare_prompts(
-    call_sid_a: str, call_sid_b: str, ctx: Context
-) -> str:
+async def compare_prompts(call_sid_a: str, call_sid_b: str, ctx: Context) -> dict[str, Any]:
     """Diff the system prompts used in two calls.
 
     Returns a unified diff showing exactly what changed between the prompts.
@@ -2266,10 +2477,13 @@ async def compare_prompts(
     """
     call_sid_a = _sanitize_sid(call_sid_a)
     call_sid_b = _sanitize_sid(call_sid_b)
-    return _fmt(await _get(
-        ctx, "/compare/prompt-diff",
-        params={"call_id_a": call_sid_a, "call_id_b": call_sid_b},
-    ))
+    return _out(
+        await _get(
+            ctx,
+            "/compare/prompt-diff",
+            params={"call_id_a": call_sid_a, "call_id_b": call_sid_b},
+        )
+    )
 
 
 async def _run_auth():
@@ -2286,9 +2500,8 @@ async def _run_auth():
         if result:
             print("Authentication successful. You can now use Lens MCP.")
             return True
-        else:
-            print("Authentication failed.")
-            return False
+        print("Authentication failed.")
+        return False
 
 
 async def _ensure_auth_before_serve():
@@ -2302,13 +2515,12 @@ async def _ensure_auth_before_serve():
 
 
 def main():
-    import sys as _sys
-    if len(_sys.argv) > 1 and _sys.argv[1] == "auth":
+    if len(sys.argv) > 1 and sys.argv[1] == "auth":
         asyncio.run(_run_auth())
-    elif len(_sys.argv) > 1 and _sys.argv[1] == "serve":
+    elif len(sys.argv) > 1 and sys.argv[1] == "serve":
         if not asyncio.run(_ensure_auth_before_serve()):
             return
-        port = int(_sys.argv[2]) if len(_sys.argv) > 2 else 8000
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
         mcp.settings.port = port
         mcp.run(transport="sse")
     else:
