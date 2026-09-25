@@ -1890,10 +1890,10 @@ def _rollup(series: list, granularity: str, dim_key: str, exact_key: str, approx
 
 def _apply_rollup(
     data: dict, granularity: str, dim_key: str, exact_key: str, approx_key: str
-) -> None:
-    """Replace data["series"] with its _rollup and add a NOTE; a no-op for backend sizes."""
+) -> dict:
+    """data with its series replaced by _rollup and a NOTE added; unchanged for backend sizes."""
     if granularity not in _CLIENT_ROLLUPS:
-        return
+        return data
     source = _CLIENT_ROLLUPS[granularity][0]
     if not isinstance(data.get("series"), list):
         # Passing the rows through would label source-size buckets as the size asked for.
@@ -1901,12 +1901,24 @@ def _apply_rollup(
             f"Unexpected response from the backend (no 'series' list) — granularity="
             f"{granularity} rollup cannot proceed. Retry with granularity={source}."
         )
-    data["series"] = _rollup(data["series"], granularity, dim_key, exact_key, approx_key)
-    data["NOTE"] = (
-        f"granularity={granularity} sums the underlying {source} buckets client-side, in UTC: "
-        f"`{exact_key}` is exact (each one belongs to one {source} bucket), `{approx_key}` is an "
-        f"upper bound (a call whose activity spans a {source} boundary is counted again in each "
-        f"bucket it touched). The first and last buckets may cover only part of their span."
+    return {
+        **data,
+        "series": _rollup(data["series"], granularity, dim_key, exact_key, approx_key),
+        "NOTE": (
+            f"granularity={granularity} sums the underlying {source} buckets client-side, in UTC: "
+            f"`{exact_key}` is exact (each one belongs to one {source} bucket), `{approx_key}` is "
+            f"an upper bound (a call whose activity spans a {source} boundary is counted again in "
+            f"each bucket it touched). The first and last buckets may cover only part of their span."
+        ),
+    }
+
+
+def _upper_bound_caveat(approx_key: str, granularity: str) -> str:
+    """The _summarize_overflow caveat for the count tools, whose approx_key sums to an upper bound."""
+    day_hint = "" if granularity == "1day" else ' granularity="1day" gives one row per day.'
+    return (
+        f" `{approx_key}` totals are upper bounds (a call active in several buckets counts in "
+        f"each).{day_hint}"
     )
 
 
@@ -2076,7 +2088,7 @@ async def event_counts_over_time(
         params["agent_id"] = agent_config_id
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/events", params=params)
-    _apply_rollup(data, granularity, "event_name", "count", "calls")
+    data = _apply_rollup(data, granularity, "event_name", "count", "calls")
     if not full_series:
         data = _summarize_overflow(
             data,
@@ -2084,9 +2096,7 @@ async def event_counts_over_time(
             "event_types",
             "event_name",
             ("count", "calls"),
-            caveat=" `calls` totals are upper bounds (a call active in several buckets counts in "
-            "each)."
-            + ("" if granularity == "1day" else ' granularity="1day" gives one row per day.'),
+            caveat=_upper_bound_caveat("calls", granularity),
         )
     return _out({"retention": _RETENTION["mv"], **data})
 
@@ -2135,7 +2145,7 @@ async def error_counts_over_time(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/error-timeseries", params=params)
-    _apply_rollup(data, granularity, "node", "errors", "affected_calls")
+    data = _apply_rollup(data, granularity, "node", "errors", "affected_calls")
     if not full_series:
         data = _summarize_overflow(
             data,
@@ -2143,9 +2153,7 @@ async def error_counts_over_time(
             "nodes",
             "node",
             ("errors", "affected_calls"),
-            caveat=" `affected_calls` totals are upper bounds (a call active in several buckets "
-            "counts in each)."
-            + ("" if granularity == "1day" else ' granularity="1day" gives one row per day.'),
+            caveat=_upper_bound_caveat("affected_calls", granularity),
         )
     return _out({"retention": _RETENTION["mv"], **data})
 

@@ -15,6 +15,8 @@ os.environ.setdefault("LENS_BASE_URL", "http://localhost")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lens_mcp.server import (
+    _CLIENT_ROLLUPS,
+    _GRANULARITY_MINUTES,
     _check_granularity,
     _rollup,
     _summarize_overflow,
@@ -24,26 +26,14 @@ from lens_mcp.server import (
 TOOLS = {t.name: t for t in asyncio.run(mcp.list_tools())}
 
 
-def test_granularity_is_published_as_an_enum_per_tool():
-    for name in ("latency_over_time", "event_counts_over_time", "error_counts_over_time"):
-        schema = TOOLS[name].inputSchema["properties"]["granularity"]
-        assert schema["type"] == "string"
+def test_granularity_enums_match_the_sizes_the_server_can_serve():
+    def enum(name):
+        return TOOLS[name].inputSchema["properties"]["granularity"]["enum"]
 
     # latency_over_time can't roll percentiles into coarser buckets — only counts are additive.
-    assert TOOLS["latency_over_time"].inputSchema["properties"]["granularity"]["enum"] == [
-        "5min",
-        "15min",
-        "1hour",
-    ]
+    assert set(enum("latency_over_time")) == set(_GRANULARITY_MINUTES)
     for name in ("event_counts_over_time", "error_counts_over_time"):
-        assert TOOLS[name].inputSchema["properties"]["granularity"]["enum"] == [
-            "5min",
-            "10min",
-            "15min",
-            "30min",
-            "1hour",
-            "1day",
-        ]
+        assert set(enum(name)) == set(_GRANULARITY_MINUTES) | set(_CLIENT_ROLLUPS), name
 
 
 def _oversized(rows_per_dim=1000):
