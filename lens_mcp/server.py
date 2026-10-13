@@ -58,8 +58,7 @@ _HIGH_SELECTIVITY = ("campaign_id", "agent_config_id", "prompt_ref")
 def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> float | None:
     """Effective look-back window in minutes; None if an explicit window can't be parsed
     (treated as unbounded so an unparseable time_from cannot slip past a cap)."""
-    if time_range_minutes and time_range_minutes > 0:
-        return float(time_range_minutes)
+    # Match _window: an explicit start takes precedence over the relative default.
     if time_from:
         try:
             start = datetime.fromisoformat(time_from)
@@ -67,6 +66,8 @@ def _window_minutes(time_range_minutes: int, time_from: str, time_to: str) -> fl
             return (end - start).total_seconds() / 60
         except (ValueError, TypeError):
             return None
+    if time_range_minutes and time_range_minutes > 0:
+        return float(time_range_minutes)
     return None  # no explicit window → fail the cap closed (the request carries no time bound, so the guard must not treat it as a safe 60 min)
 
 
