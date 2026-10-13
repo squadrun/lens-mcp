@@ -259,6 +259,9 @@ async def _ensure_auth(ctx: Context) -> None:
 _RETRY_STATUS = {429, 502, 503, 504}
 _LOAD_SHED_STATUS = {429, 503}
 _MAX_RETRIES = 2
+# A timeout has already waited TIMEOUT seconds; when lens or the path to it is down, every
+# further attempt waits that long again and fails the same way.
+_MAX_TIMEOUT_RETRIES = 1
 _MAX_RETRY_SLEEP = 15.0
 
 
@@ -283,11 +286,19 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
     for attempt in range(_MAX_RETRIES + 1):
         try:
             resp = await client.get(url, params=params)
-        except (httpx.TimeoutException, httpx.TransportError):
+        except httpx.TransportError as e:
             # Gateway blips on wide time ranges are transient; retrying here is far
             # cheaper than surfacing a 504 and making the caller redo the analysis.
-            if attempt == _MAX_RETRIES:
-                raise
+            timed_out = isinstance(e, httpx.TimeoutException)
+            if attempt >= (_MAX_TIMEOUT_RETRIES if timed_out else _MAX_RETRIES):
+                # str() of an httpx timeout is "", which reached the caller as a blank error.
+                cause = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                waited = f" ({TIMEOUT:.0f}s each)" if timed_out else ""
+                raise RuntimeError(
+                    f"lens did not answer GET {path} after {attempt + 1} attempts{waited}: "
+                    f"{cause}. lens or the network path to it is down; retrying now is "
+                    f"unlikely to help."
+                ) from e
             await asyncio.sleep(_retry_sleep(None, attempt))
             continue
 
