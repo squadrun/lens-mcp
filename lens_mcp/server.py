@@ -27,7 +27,7 @@ import sys
 import tempfile
 from collections.abc import Iterable
 from contextlib import asynccontextmanager, contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,14 +50,22 @@ try:
 except Exception:
     _VERSION = "unknown"
 
-_CALLS_PAGE = 200  # server-side hard cap on /calls; each page re-runs the full dedup aggregation
+# /calls page for the cohort scan; each page re-runs the full dedup aggregation, so ask for the
+# most rows the server allows. The ext API allows 200 once squadrun/lens#98 is deployed and 100
+# before it: a 422 drops to the fallback for the rest of the process (see _get_capped).
+_CALLS_PAGE = 200
+_CALLS_PAGE_FALLBACK = 100
 _MAX_CALLS_SCAN = 1000
 _SPAN_PAGE_SIZE = 500  # get_call_spans page: the backend's default, sized for token cost
 # Whole-call fetches ask for the backend's per-call maximum. Paging /call/{id}/spans re-sorts the
 # call on every page and is not stable across equal timestamps; the backend measured no call above
 # 5000 spans, so one request per call is the normal case.
+# Older ext backends cap /call/{id}/spans at 500 (raised by squadrun/lens#98): same 422 fallback.
 _SPAN_FETCH_SIZE = 5000
-_MAX_SPAN_PAGES = 2  # 10k spans — beyond any real call, bounds runaway paging
+_SPAN_FETCH_FALLBACK = 500
+_MAX_SPANS_PER_CALL = 10_000  # beyond any real call, bounds runaway paging
+# Current per-request cap by kind; lowered once on a 422 from a backend that predates lens#98.
+_page_caps = {"spans": _SPAN_FETCH_SIZE, "calls": _CALLS_PAGE}
 _COHORT_CONCURRENCY = 8
 # A fleet-wide trace-log scan and a sort on a non-indexed span column both read/sort the whole
 # matched set. Safe over a short window; unbounded they pressure the box. Cap the window to 2h
@@ -701,7 +709,7 @@ async def _fetch_all_spans(
     only past that; pages are ordered by timestamp_ms alone, so rows sharing a timestamp at a
     page boundary can repeat or drop.
     """
-    base: dict = {"limit": _SPAN_FETCH_SIZE}
+    base: dict = {}
     if node:
         base["node"] = node
     if phase:
@@ -711,14 +719,30 @@ async def _fetch_all_spans(
 
     spans: list[dict] = []
     offset = 0
-    for _ in range(_MAX_SPAN_PAGES):
-        data = await _get(ctx, f"/call/{call_sid}/spans", params={**base, "offset": offset})
+    while len(spans) < _MAX_SPANS_PER_CALL:
+        params = {**base, "limit": _page_caps["spans"], "offset": offset}
+        data = await _get_capped(
+            ctx, f"/call/{call_sid}/spans", params, "spans", _SPAN_FETCH_FALLBACK
+        )
         page = data.get("spans", [])
         spans.extend(page)
         if not page or not data.get("has_more"):
             return spans, True
         offset += len(page)
     return spans, False
+
+
+async def _get_capped(ctx: Context, path: str, params: dict, kind: str, fallback: int) -> dict:
+    """GET with params["limit"] at the current cap for `kind`. A backend that predates
+    squadrun/lens#98 rejects the larger limit with 422: drop to `fallback` for the rest of the
+    process and retry once, so the tools work before and after that deploy."""
+    try:
+        return await _get(ctx, path, params=params)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 422 or params.get("limit", 0) <= fallback:
+            raise
+        _page_caps[kind] = fallback
+        return await _get(ctx, path, params={**params, "limit": fallback})
 
 
 def _percentile(ordered: list[float], p: float) -> float:
@@ -966,7 +990,7 @@ async def aggregate_spans(
     }
     if not complete:
         out["WARNING"] = (
-            f"Stopped after {_MAX_SPAN_PAGES * _SPAN_FETCH_SIZE} spans — statistics "
+            f"Stopped after {_MAX_SPANS_PER_CALL} spans — statistics "
             f"cover only that prefix of the call. Narrow with node/phase and re-run."
         )
     return _out(out)
@@ -2284,14 +2308,16 @@ async def list_calls(
         start_time_from: ISO8601 start time (alternative to time_range_minutes). No cap — use for calls older than 7 days.
         start_time_to: ISO8601 end time.
         limit: Max results (default 20, max 100). With min_turns / min_duration_ms, the max number of matching calls returned.
-        offset: Scan position in the unfiltered listing, not a count of matches. With min_turns /
-            min_duration_ms, continue with the returned next_offset; passing offset=<number of
-            matches> re-reads rows.
+        offset: Row offset into the listing. With min_turns / min_duration_ms, always continue
+            with the returned next_offset plus start_time_from_pinned / start_time_to_pinned
+            (the scan pins its window at the first request): on a backend that filters
+            server-side (server_filtered=true) offset counts matching calls, otherwise it is a
+            scan position in the unfiltered listing, so offset=<number of matches> re-reads rows.
         agent_id: Filter by agent ID.
         pipecat_version: Filter by the pipeline framework version the call ran on.
         fields: Comma-separated keys to keep per call (e.g. "call_id,duration_ms,total_turns"). Empty = whole rows.
-        min_turns: Keep only calls with at least this many total_turns. Applied client-side: the listing is paged by 200 and filtered here, because the backend has no such filter.
-        min_duration_ms: Keep only calls at least this long. Client-side, same paging as min_turns.
+        min_turns: Keep only calls with at least this many total_turns. Sent to the backend, which filters server-side when it supports it (squadrun/lens#98; the result says server_filtered); otherwise the listing is paged and filtered here.
+        min_duration_ms: Keep only calls at least this long. Same as min_turns.
             Warning: the newest calls are often still running and show total_turns 0 and no
             duration_ms, so min_turns / min_duration_ms can match nothing on a window ending "now".
             Set start_time_to an hour or so in the past to skip them.
@@ -2339,12 +2365,38 @@ async def list_calls(
 
     cap = min(max(max_scan, 1), _MAX_CALLS_SCAN)
     keep = min(max(limit, 1), 100)
+    # Pin the window at the first request, so calls arriving mid-scan cannot push rows down
+    # between pages and a relative window cannot slide. Pass the reported
+    # start_time_from_pinned / start_time_to_pinned back with next_offset to continue.
+    pinned_to = pinned_from = ""
+    if not start_time_to:
+        now = datetime.now(UTC)
+        pinned_to = params["start_time_to"] = now.isoformat(timespec="seconds")
+        if "time_range_minutes" in params:
+            minutes = params.pop("time_range_minutes")
+            pinned_from = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+            params["start_time_from"] = pinned_from
+    # Backends with squadrun/lens#98 filter these server-side and say so in filters_applied;
+    # older ones ignore the params, and the client-side check below does the work.
+    if min_turns > 0:
+        params["min_turns"] = min_turns
+    if min_duration_ms > 0:
+        params["min_duration_ms"] = min_duration_ms
+    server_filtered = False
     matched: list[dict] = []
     seen: set[str] = set()
     scanned, pos, complete = 0, max(offset, 0), False
     while scanned < cap:
-        page_size = min(_CALLS_PAGE, cap - scanned)
-        data = await _get(ctx, "/calls", params={**params, "limit": page_size, "offset": pos})
+        page_size = min(_page_caps["calls"], cap - scanned)
+        data = await _get_capped(
+            ctx,
+            "/calls",
+            {**params, "limit": page_size, "offset": pos},
+            "calls",
+            _CALLS_PAGE_FALLBACK,
+        )
+        page_size = min(page_size, _page_caps["calls"])  # what was actually asked for
+        server_filtered = bool(data.get("filters_applied"))
         rows = data.get("calls", [])
         scanned += len(rows)
         pos += len(rows)
@@ -2371,6 +2423,9 @@ async def list_calls(
             "matched": len(matched),
             "scan_complete": complete,
             "next_offset": None if complete else pos,
+            "server_filtered": server_filtered,
+            "start_time_from_pinned": pinned_from or None,
+            "start_time_to_pinned": pinned_to or None,
         }
     )
 

@@ -32,7 +32,7 @@ with Bash. Conversation-text metadata keys (`text`, `transcript`, `message`, `pr
 over 64 characters and any dict or list value are dropped unless `include_text=True`; the result
 lists every withheld key in `dropped_text_columns`.
 
-`list_calls` cohort filters (`min_turns`, `min_duration_ms`): the newest calls are often still running (`total_turns` 0, no `duration_ms`), so set `start_time_to` an hour or so in the past. `offset` is a scan position in the unfiltered listing, not a match count; continue with the returned `next_offset`.
+`list_calls` cohort filters (`min_turns`, `min_duration_ms`): the newest calls are often still running (`total_turns` 0, no `duration_ms`), so set `start_time_to` an hour or so in the past. To page, always pass back the returned `next_offset` with `start_time_from_pinned` / `start_time_to_pinned` (the scan pins its window at the first request); on an older backend `offset` is a scan position in the unfiltered listing, not a match count.
 
 ```text
 export_spans(call_sids="@/tmp/sids.txt", node="llm", event_name="llm.usage",
@@ -51,7 +51,9 @@ uv --directory ~/.cache/lens-mcp/repo run lens-mcp export-turns @/tmp/sids.txt -
 
 To read a little rather than export: `get_call_spans`, `search_spans` and `list_calls` take
 `fields="a,b,metadata.key"`; `get_call_spans` takes `event_name`; `list_calls` takes `min_turns`,
-`min_duration_ms` and `max_scan` (client-side cohort filter, reports `scanned` / `scan_complete`).
+`min_duration_ms` and `max_scan` (filtered by the backend where it supports it, else client-side; reports `server_filtered`, `scanned` / `scan_complete`).
+
+Page sizes follow the backend: whole-call span fetches ask for 5000 rows and cohort scans 200 calls per request (squadrun/lens#98). An older backend rejects those with 422, and the client drops to 500 / 100 for the rest of the process.
 Tool results are compact JSON, not indented.
 
 Two rules the tools enforce rather than merely document:

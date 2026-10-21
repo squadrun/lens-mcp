@@ -11,6 +11,8 @@ import stat
 import sys
 import tempfile
 
+import httpx
+
 sys.path.insert(0, os.path.dirname(__file__))
 from fakes import FakeLens, ctx, main, patched, run, server, span
 from mcp import types
@@ -244,12 +246,13 @@ def test_export_spans_reports_failed_and_truncated_calls():
     assert out["calls_ok"] == 2 and out["rows"] == 3
     assert out["calls_failed"] == [{"call_id": "c2", "error": "RuntimeError: boom"}]
     # Paging that never ends is flagged, not silently returned as complete.
-    real = server._MAX_SPAN_PAGES, server._SPAN_FETCH_SIZE
-    server._MAX_SPAN_PAGES, server._SPAN_FETCH_SIZE = 1, 500
+    real = server._MAX_SPANS_PER_CALL, dict(server._page_caps)
+    server._MAX_SPANS_PER_CALL, server._page_caps["spans"] = 500, 500
     try:
         out = export(fake=FakeLens(spans={"c1": usage_spans(600)}), call_sids="c1", out_name="e")
     finally:
-        server._MAX_SPAN_PAGES, server._SPAN_FETCH_SIZE = real
+        server._MAX_SPANS_PER_CALL = real[0]
+        server._page_caps.update(real[1])
     assert out["calls_truncated"] == ["c1"] and out["rows"] == 500
 
 
@@ -357,6 +360,106 @@ def test_cli_runs_export_spans_through_a_standalone_context():
     # The context the CLI hands _get is the same shape the MCP lifespan provides.
     c = server._CliContext(None).request_context.lifespan_context
     assert c == {"client": None, "authenticated": False}
+
+
+class OldBackend(FakeLens):
+    """A backend that predates squadrun/lens#98: 422 above 500 spans / 100 calls per request."""
+
+    async def get(self, ctx, path, params=None):
+        params = params or {}
+        cap = 100 if path == "/calls" else 500
+        if params.get("limit", 0) > cap:
+            self.requests.append((path, dict(params)))
+            req = httpx.Request("GET", "http://localhost" + path)
+            raise httpx.HTTPStatusError(
+                "422", request=req, response=httpx.Response(422, request=req)
+            )
+        return await super().get(ctx, path, params)
+
+
+def caps_reset():
+    server._page_caps.update(spans=server._SPAN_FETCH_SIZE, calls=server._CALLS_PAGE)
+
+
+def test_old_backend_spans_fall_back_to_500_and_page():
+    caps_reset()
+    fake = OldBackend(spans={"c1": usage_spans(1200)})
+    try:
+        out = export(fake=fake, call_sids="c1", out_name="old_spans")
+        limits = [p["limit"] for path, p in fake.requests if "/spans" in path]
+        assert limits[0] == 5000 and set(limits[1:]) == {500}  # one 422, then 500-row pages
+        assert out["rows"] == 1200 and out["calls_truncated"] == [] and out["calls_ok"] == 1
+        assert server._page_caps["spans"] == 500  # remembered for the rest of the process
+    finally:
+        caps_reset()
+
+
+def test_old_backend_calls_scan_falls_back_to_100():
+    caps_reset()
+    fake = OldBackend(calls=calls(250))
+    try:
+        with patched(fake):
+            out = tool("list_calls", min_turns=9, limit=100, max_scan=250)
+        limits = [p["limit"] for _, p in fake.requests]
+        assert limits[0] == 200 and limits[1:] == [100, 100, 50]
+        assert out["scanned"] == 250 and out["scan_complete"] is False
+        assert out["next_offset"] == 250
+    finally:
+        caps_reset()
+
+
+def test_a_422_at_the_fallback_size_is_raised_not_retried():
+    caps_reset()
+    server._page_caps["spans"] = 500
+
+    class Always422(FakeLens):
+        async def get(self, ctx, path, params=None):
+            req = httpx.Request("GET", "http://localhost" + path)
+            raise httpx.HTTPStatusError(
+                "422", request=req, response=httpx.Response(422, request=req)
+            )
+
+    try:
+        out = export(fake=Always422(), call_sids="c1", out_name="bad")
+        assert out["calls_ok"] == 0 and "422" in out["calls_failed"][0]["error"]
+    finally:
+        caps_reset()
+
+
+def test_list_calls_scan_pins_a_relative_window():
+    caps_reset()
+    fake = FakeLens(calls=calls(450))
+    with patched(fake):
+        out = tool("list_calls", min_turns=9, limit=100, max_scan=400, time_range_minutes=90)
+    to, frm = out["start_time_to_pinned"], out["start_time_from_pinned"]
+    assert to and frm and frm < to
+    assert all(p["start_time_to"] == to and p["start_time_from"] == frm for _, p in fake.requests)
+    assert all("time_range_minutes" not in p for _, p in fake.requests)
+    with patched(FakeLens(calls=calls(10))) as f2:
+        out = tool("list_calls", min_turns=1, start_time_to="2026-01-01T00:00:00+00:00")
+    assert out["start_time_to_pinned"] is None and out["start_time_from_pinned"] is None
+    assert f2.requests[0][1]["start_time_to"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_list_calls_scan_uses_server_side_filters_when_the_backend_reports_them():
+    caps_reset()
+
+    class NewBackend(FakeLens):
+        async def get(self, ctx, path, params=None):
+            params = params or {}
+            self.requests.append((path, dict(params)))
+            rows = [c for c in self.calls if c["total_turns"] >= params.get("min_turns", 0)]
+            off, lim = params.get("offset", 0), params.get("limit", 20)
+            return {"calls": rows[off : off + lim], "filters_applied": ["min_turns"]}
+
+    fake = NewBackend(calls=calls(450))
+    with patched(fake):
+        out = tool("list_calls", min_turns=9, limit=20, max_scan=1000)
+    assert fake.requests[0][1]["min_turns"] == 9 and out["server_filtered"] is True
+    assert out["matched"] >= 20 and all(c["total_turns"] >= 9 for c in out["calls"])
+    with patched(FakeLens(calls=calls(450))):  # old backend: params ignored, client filters
+        out = tool("list_calls", min_turns=9, limit=20, max_scan=1000)
+    assert out["server_filtered"] is False and all(c["total_turns"] >= 9 for c in out["calls"])
 
 
 if __name__ == "__main__":
