@@ -40,7 +40,9 @@ def test_nothing_is_destructive_and_everything_is_open_world():
     for t in TOOLS:
         a = t.annotations
         assert a.destructiveHint is False, f"{t.name} claims destructive"
-        assert a.idempotentHint is True, f"{t.name} is not marked idempotent"
+        # An export writes a new file per call, so only it may be non-idempotent.
+        idempotent = not t.name.startswith("export_")
+        assert a.idempotentHint is idempotent, f"{t.name} idempotentHint should be {idempotent}"
         assert a.openWorldHint is True, f"{t.name} is not marked open-world"
 
 

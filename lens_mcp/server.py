@@ -19,13 +19,14 @@ import argparse
 import asyncio
 import base64
 import csv
-import io
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
-from contextlib import asynccontextmanager, suppress
+from collections.abc import Iterable
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -49,10 +50,14 @@ try:
 except Exception:
     _VERSION = "unknown"
 
-_CALLS_PAGE = 100  # server-side hard cap on /calls
+_CALLS_PAGE = 200  # server-side hard cap on /calls; each page re-runs the full dedup aggregation
 _MAX_CALLS_SCAN = 1000
-_SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
-_MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
+_SPAN_PAGE_SIZE = 500  # get_call_spans page: the backend's default, sized for token cost
+# Whole-call fetches ask for the backend's per-call maximum. Paging /call/{id}/spans re-sorts the
+# call on every page and is not stable across equal timestamps; the backend measured no call above
+# 5000 spans, so one request per call is the normal case.
+_SPAN_FETCH_SIZE = 5000
+_MAX_SPAN_PAGES = 2  # 10k spans — beyond any real call, bounds runaway paging
 _COHORT_CONCURRENCY = 8
 # A fleet-wide trace-log scan and a sort on a non-indexed span column both read/sort the whole
 # matched set. Safe over a short window; unbounded they pressure the box. Cap the window to 2h
@@ -236,6 +241,11 @@ READ_ONLY = ToolAnnotations(
 # They overwrite the same per-SID paths on a repeat call, hence idempotent.
 WRITES_LOCAL_FILES = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+# The export_* tools write a new file on every call (the default name is unique), so a repeat
+# is not a no-op.
+EXPORTS_LOCAL_FILES = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
 )
 
 
@@ -685,14 +695,13 @@ async def get_call_spans(
 async def _fetch_all_spans(
     ctx: Context, call_sid: str, node: str = "", phase: str = "", event_name: str = ""
 ) -> tuple[list[dict], bool]:
-    """Page /call/{id}/spans to exhaustion. Returns (spans, complete).
+    """Fetch a call's spans to exhaustion. Returns (spans, complete).
 
-    A single response is capped at 500 rows and only advertises truncation via
-    has_more, so statistics computed from one unpaged response are silently wrong
-    on long calls. Paging is stable: rows come back in (turn_number, timestamp_ms)
-    order with no overlap between pages.
+    Asks for the backend's per-call maximum, so a call is one request. A further page is read
+    only past that; pages are ordered by timestamp_ms alone, so rows sharing a timestamp at a
+    page boundary can repeat or drop.
     """
-    base: dict = {"limit": _SPAN_PAGE_SIZE}
+    base: dict = {"limit": _SPAN_FETCH_SIZE}
     if node:
         base["node"] = node
     if phase:
@@ -957,7 +966,7 @@ async def aggregate_spans(
     }
     if not complete:
         out["WARNING"] = (
-            f"Stopped after {_MAX_SPAN_PAGES * _SPAN_PAGE_SIZE} spans — statistics "
+            f"Stopped after {_MAX_SPAN_PAGES * _SPAN_FETCH_SIZE} spans — statistics "
             f"cover only that prefix of the call. Narrow with node/phase and re-run."
         )
     return _out(out)
@@ -1381,13 +1390,28 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
     return await _download_logs(ctx, call_sids, "traces", "traces", "trace logs")
 
 
+@contextmanager
+def _private_file(path: str):
+    """A text handle on a 0600 temp file beside path, renamed onto it on success, so a partial
+    write is never visible under the final path. The temp name is unique, so concurrent writers
+    of one path never share it; the last to finish wins."""
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            yield f
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
 def _write_private(path: str, text: str) -> int:
-    """Write text via a 0600 temp file + rename, so a partial write is never
-    visible under the final path. Returns the character count."""
-    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    """Write text to path through _private_file. Returns the character count."""
+    with _private_file(path) as f:
         f.write(text)
-    os.rename(path + ".tmp", path)
     return len(text)
 
 
@@ -1483,7 +1507,8 @@ def _export_path(out_name: str, stem: str, ext: str) -> str:
             raise ValueError(f"out_name must be a plain file name, got {out_name!r}")
         name = out_name if out_name.endswith(f".{ext}") else f"{out_name}.{ext}"
     else:
-        name = f"{stem}_{datetime.now(UTC):%Y%m%dT%H%M%S}.{ext}"
+        # Parallel tool calls land in the same second; the suffix keeps their files apart.
+        name = f"{stem}_{datetime.now(UTC):%Y%m%dT%H%M%S}_{secrets.token_hex(3)}.{ext}"
     return os.path.join(scratchpad, name)
 
 
@@ -1495,12 +1520,21 @@ def _cell(v: Any) -> Any:
     return v
 
 
-def _write_csv(path: str, columns: list[str], rows: list[dict]) -> None:
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, columns, extrasaction="ignore", restval="", lineterminator="\n")
-    w.writeheader()
-    w.writerows({k: _cell(v) for k, v in r.items()} for r in rows)
-    _write_private(path, buf.getvalue())
+def _write_csv(path: str, columns: list[str], rows: Iterable[dict]) -> None:
+    with _private_file(path) as f:
+        w = csv.DictWriter(f, columns, extrasaction="ignore", restval="", lineterminator="\n")
+        w.writeheader()
+        w.writerows({k: _cell(v) for k, v in r.items()} for r in rows)
+
+
+def _write_jsonl(path: str, columns: list[str], rows: Iterable[dict]) -> None:
+    with _private_file(path) as f:
+        for r in rows:
+            f.write(_jsonl_line({c: r[c] for c in columns if c in r}))
+
+
+def _jsonl_line(row: dict) -> str:
+    return json.dumps(row, separators=(",", ":"), ensure_ascii=False, default=str) + "\n"
 
 
 async def _per_call(sids: list[str], work) -> list[tuple[str, Any, str | None]]:
@@ -1518,6 +1552,8 @@ async def _per_call(sids: list[str], work) -> list[tuple[str, Any, str | None]]:
 
 
 _MAX_SHORT_TEXT = 64
+# Top-level span columns that are free text. error_message can quote what the caller said.
+_TEXT_COLUMNS = frozenset({"error_message"})
 
 
 def _withheld(key: str, value: Any) -> bool:
@@ -1535,7 +1571,15 @@ def _withheld(key: str, value: Any) -> bool:
 
 def _flatten_span(span: dict, include_text: bool, withheld: set[str] | None = None) -> dict:
     """Flatten a span; with include_text=False, withheld metadata keys are added to `withheld`."""
-    flat = {k: v for k, v in span.items() if k != "metadata"}
+    flat = {}
+    for k, v in span.items():
+        if k == "metadata":
+            continue
+        if not include_text and k in _TEXT_COLUMNS and _withheld(k, v):
+            if withheld is not None:
+                withheld.add(k)
+            continue
+        flat[k] = v
     for k, v in _span_metadata(span).items():
         if include_text or not _withheld(k, v):
             flat[f"metadata.{k}"] = v
@@ -1563,57 +1607,69 @@ async def _export_spans_core(
     await _ensure_auth(ctx)
 
     withheld: set[str] = set()
+    seen: dict[str, None] = {}  # every column written, in first-seen order
 
-    async def work(sid: str):
-        spans, complete = await _fetch_all_spans(
-            ctx, sid, node=node, phase=phase, event_name=event_name
-        )
-        return [_flatten_span(s, include_text, withheld) for s in spans], complete
+    # Rows stream to a private staging file as each call finishes, so memory holds at most
+    # _EXPORT_CONCURRENCY calls. Which keys are withheld is only known at the end, so the final
+    # file is written from the staging file in a second pass.
+    fd, stage_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".spans_", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w+") as stage:
 
-    rows: list[dict] = []
-    ok, failed, truncated = 0, [], []
-    for sid, res, err in await _per_call(sids, work):
-        if err:
-            failed.append({"call_id": sid, "error": err})
-            continue
-        ok += 1
-        flat, complete = res
-        if not complete:
-            truncated.append(sid)
-        rows.extend({"call_id": sid, **f} for f in flat)
+            async def work(sid: str):
+                spans, complete = await _fetch_all_spans(
+                    ctx, sid, node=node, phase=phase, event_name=event_name
+                )
+                # No await from here on, so concurrent calls never interleave their rows.
+                for s in spans:
+                    flat = {"call_id": sid, **_flatten_span(s, include_text, withheld)}
+                    if wanted:
+                        flat = {k: flat[k] for k in ("call_id", *wanted) if k in flat}
+                    seen.update(dict.fromkeys(flat))
+                    stage.write(_jsonl_line(flat))
+                return len(spans), complete
 
-    dropped: set[str] = set(withheld)
-    if wanted:
-        if not include_text:
-            dropped |= {
-                f for f in wanted if f.startswith("metadata.") and f[9:].lower() in _TEXT_KEYS
-            }
-        columns = ["call_id"] + [f for f in wanted if f not in dropped]
-    else:
-        columns = list(dict.fromkeys(k for r in rows for k in r))
-        columns = ["call_id"] + [c for c in columns if c != "call_id"]
-    rows = [{c: r[c] for c in columns if c in r} for r in rows]
+            n_rows, ok, failed, truncated = 0, 0, [], []
+            for sid, res, err in await _per_call(sids, work):
+                if err:
+                    failed.append({"call_id": sid, "error": err})
+                    continue
+                ok += 1
+                n, complete = res
+                n_rows += n
+                if not complete:
+                    truncated.append(sid)
 
-    out = {"path": None, "rows": len(rows), "columns": columns}
-    if ok:
-        if format == "csv":
-            _write_csv(path, columns, rows)
-        else:
-            _write_private(
-                path,
-                "".join(
-                    json.dumps(r, separators=(",", ":"), ensure_ascii=False, default=str) + "\n"
-                    for r in rows
-                ),
-            )
-        out["path"] = path
+            # A key withheld on any row is dropped from every row, so a column is never
+            # partly blank.
+            dropped: set[str] = set(withheld)
+            if wanted:
+                if not include_text:
+                    dropped |= {
+                        f
+                        for f in wanted
+                        if f.startswith("metadata.") and f[9:].lower() in _TEXT_KEYS
+                    }
+                columns = ["call_id"] + [f for f in wanted if f not in dropped]
+            else:
+                columns = ["call_id"] + [c for c in seen if c != "call_id" and c not in dropped]
+
+            out = {"path": None, "rows": n_rows, "columns": columns}
+            if ok:
+                stage.seek(0)
+                rows = (json.loads(line) for line in stage)
+                (_write_csv if format == "csv" else _write_jsonl)(path, columns, rows)
+                out["path"] = path
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(stage_path)
     out.update(calls_ok=ok, calls_failed=failed, calls_truncated=truncated)
     if dropped:
         out["dropped_text_columns"] = sorted(dropped)
     return out
 
 
-@mcp.tool(annotations=WRITES_LOCAL_FILES)
+@mcp.tool(annotations=EXPORTS_LOCAL_FILES)
 async def export_spans(
     call_sids: str,
     ctx: Context,
@@ -1629,14 +1685,16 @@ async def export_spans(
 
     Use this instead of get_call_spans / search_spans whenever you want to analyse spans
     across more than a couple of calls: the rows go to disk, so none of them cost context
-    tokens. Then work on the file with Bash (python, duckdb, awk). Each call is paged to
-    exhaustion, so the file is complete unless the call appears in calls_truncated.
+    tokens. Then work on the file with Bash (python, duckdb, awk). Each call is read whole,
+    so the file is complete unless the call appears in calls_truncated. Rows are grouped by
+    call, in the order the calls finish.
 
     Privacy: unless include_text=True, metadata keys that hold conversation text (text,
     transcript, message, content, last_user_message, prompt, user_text, llm_reply) are dropped,
     and so is any metadata value that is a string over 64 characters or a dict/list (they can
-    nest conversation text). Numbers, bools, None and short strings are kept. Every withheld
-    key is listed in dropped_text_columns, including keys requested via fields.
+    nest conversation text). A long error_message is withheld the same way. Numbers, bools,
+    None and short strings are kept. A key withheld on any row is dropped from every row, and
+    every withheld key is listed in dropped_text_columns, including keys requested via fields.
     The file is written 0600 into CLAUDE_SCRATCHPAD_DIR (default: the system temp dir).
 
     Args:
@@ -1649,7 +1707,7 @@ async def export_spans(
             top-level key plus every metadata key, flattened as metadata.<key>.
         format: "csv" (default) or "jsonl".
         include_text: Keep the metadata the privacy rule above would withhold.
-        out_name: File name inside the scratchpad dir (default spans_<UTC timestamp>.<format>).
+        out_name: File name inside the scratchpad dir (default spans_<UTC timestamp>_<random>.<format>).
     """
     return _out(
         await _export_spans_core(
@@ -1909,7 +1967,7 @@ async def _export_turns_core(
     return out
 
 
-@mcp.tool(annotations=WRITES_LOCAL_FILES)
+@mcp.tool(annotations=EXPORTS_LOCAL_FILES)
 async def export_turn_latency(
     call_sids: str, ctx: Context, max_turn: int = 10, out_name: str = ""
 ) -> dict[str, Any]:
@@ -1930,7 +1988,7 @@ async def export_turn_latency(
         call_sids: Comma-separated call SIDs, or "@/abs/path" naming a file with one SID per
             line. At most 1000 calls per invocation.
         max_turn: Highest turn_number to export (default 10).
-        out_name: File name inside the scratchpad dir (default turn_latency_<UTC timestamp>.csv).
+        out_name: File name inside the scratchpad dir (default turn_latency_<UTC timestamp>_<random>.csv).
     """
     return _out(await _export_turns_core(ctx, call_sids, max_turn, out_name))
 
@@ -2232,7 +2290,7 @@ async def list_calls(
         agent_id: Filter by agent ID.
         pipecat_version: Filter by the pipeline framework version the call ran on.
         fields: Comma-separated keys to keep per call (e.g. "call_id,duration_ms,total_turns"). Empty = whole rows.
-        min_turns: Keep only calls with at least this many total_turns. Applied client-side: the listing is paged by 100 and filtered here, because the backend has no such filter.
+        min_turns: Keep only calls with at least this many total_turns. Applied client-side: the listing is paged by 200 and filtered here, because the backend has no such filter.
         min_duration_ms: Keep only calls at least this long. Client-side, same paging as min_turns.
             Warning: the newest calls are often still running and show total_turns 0 and no
             duration_ms, so min_turns / min_duration_ms can match nothing on a window ending "now".
@@ -2282,6 +2340,7 @@ async def list_calls(
     cap = min(max(max_scan, 1), _MAX_CALLS_SCAN)
     keep = min(max(limit, 1), 100)
     matched: list[dict] = []
+    seen: set[str] = set()
     scanned, pos, complete = 0, max(offset, 0), False
     while scanned < cap:
         page_size = min(_CALLS_PAGE, cap - scanned)
@@ -2289,12 +2348,16 @@ async def list_calls(
         rows = data.get("calls", [])
         scanned += len(rows)
         pos += len(rows)
-        matched.extend(
-            r
-            for r in rows
-            if (r.get("total_turns") or 0) >= min_turns
-            and (r.get("duration_ms") or 0) >= min_duration_ms
-        )
+        for r in rows:
+            # Calls starting mid-scan shift the newest-first listing down, so a row can come
+            # back on the next page.
+            if r.get("call_id") in seen:
+                continue
+            seen.add(r.get("call_id"))
+            if (r.get("total_turns") or 0) >= min_turns and (
+                r.get("duration_ms") or 0
+            ) >= min_duration_ms:
+                matched.append(r)
         if len(rows) < page_size:
             complete = True
             break

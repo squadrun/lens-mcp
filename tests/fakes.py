@@ -31,9 +31,10 @@ def span(node, event, ts, turn, phase=None, value=None, **md):
 
 
 class FakeLens:
-    def __init__(self, spans=None, calls=None, failing=()):
+    def __init__(self, spans=None, calls=None, failing=(), calls_pages=None):
         self.spans = spans or {}
         self.calls = calls or []
+        self.calls_pages = calls_pages  # optional list of /calls responses, served in order
         self.failing = set(failing)
         self.requests = []
 
@@ -41,6 +42,8 @@ class FakeLens:
         params = params or {}
         self.requests.append((path, dict(params)))
         if path == "/calls":
+            if self.calls_pages is not None:
+                return {"calls": self.calls_pages.pop(0) if self.calls_pages else []}
             off, lim = params.get("offset", 0), params.get("limit", 20)
             return {"calls": self.calls[off : off + lim]}
         sid = path.split("/")[2]
@@ -53,7 +56,7 @@ class FakeLens:
             rows = [r for r in rows if r["phase"] == params["phase"]]
         if params.get("event_name"):
             rows = [r for r in rows if r["event_name"] == params["event_name"]]
-        off, lim = params.get("offset", 0), min(params.get("limit", 500), 500)
+        off, lim = params.get("offset", 0), min(params.get("limit", 500), 5000)
         page = rows[off : off + lim]
         return {"spans": page, "total": len(rows), "has_more": off + lim < len(rows)}
 

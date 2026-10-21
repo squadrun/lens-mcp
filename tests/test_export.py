@@ -122,8 +122,8 @@ def test_list_calls_cohort_pages_until_max_scan():
     fake = FakeLens(calls=calls(450))
     with patched(fake):
         out = tool("list_calls", min_turns=9, limit=100, max_scan=250)
-    assert [p["offset"] for _, p in fake.requests] == [0, 100, 200]
-    assert [p["limit"] for _, p in fake.requests] == [100, 100, 50]  # last page clipped to cap
+    assert [p["offset"] for _, p in fake.requests] == [0, 200]
+    assert [p["limit"] for _, p in fake.requests] == [200, 50]  # last page clipped to cap
     assert out["scanned"] == 250 and out["matched"] == 25 and out["scan_complete"] is False
     assert out["next_offset"] == 250
     assert all(c["total_turns"] >= 9 for c in out["calls"]) and len(out["calls"]) == 25
@@ -142,8 +142,22 @@ def test_list_calls_cohort_stops_once_limit_is_met_and_respects_fields():
     with patched(fake):
         out = tool("list_calls", min_turns=1, limit=5, max_scan=1000, fields="call_id,total_turns")
     assert len(fake.requests) == 1 and len(out["calls"]) == 5
-    assert out["scan_complete"] is False and out["next_offset"] == 100
+    assert out["scan_complete"] is False and out["next_offset"] == 200
     assert set(out["calls"][0]) == {"call_id", "total_turns"}
+
+
+def test_list_calls_cohort_skips_a_call_repeated_on_the_next_page():
+    page1 = [
+        {"call_id": f"c{i}", "total_turns": int(i == 199), "duration_ms": 1} for i in range(200)
+    ]
+    page2 = [{"call_id": "c199", "total_turns": 5, "duration_ms": 1}] + [
+        {"call_id": f"d{i}", "total_turns": 5, "duration_ms": 1} for i in range(3)
+    ]
+    fake = FakeLens(calls_pages=[page1, page2])
+    with patched(fake):
+        out = tool("list_calls", min_turns=1, limit=100, max_scan=1000)
+    ids = [c["call_id"] for c in out["calls"]]
+    assert ids == ["c199", "d0", "d1", "d2"] and out["matched"] == 4 and out["scanned"] == 204
 
 
 def test_list_calls_scan_cap_is_1000():
@@ -158,9 +172,10 @@ def export(**kw):
         return run(server._export_spans_core(ctx(), **kw))
 
 
-def test_export_spans_pages_past_500_and_writes_csv_0600():
+def test_export_spans_reads_each_call_in_one_request_and_writes_csv_0600():
     fake = FakeLens(spans={"c1": usage_spans(1200), "c2": usage_spans(3)})
     out = export(fake=fake, call_sids="c1,c2", event_name="llm.usage", out_name="a")
+    assert [p["limit"] for _, p in fake.requests] == [5000, 5000]
     assert out["rows"] == 1203 and out["calls_ok"] == 2 and out["calls_failed"] == []
     assert out["calls_truncated"] == [] and out["path"] == os.path.join(SCRATCH, "a.csv")
     assert stat.S_IMODE(os.stat(out["path"]).st_mode) == 0o600
@@ -229,12 +244,12 @@ def test_export_spans_reports_failed_and_truncated_calls():
     assert out["calls_ok"] == 2 and out["rows"] == 3
     assert out["calls_failed"] == [{"call_id": "c2", "error": "RuntimeError: boom"}]
     # Paging that never ends is flagged, not silently returned as complete.
-    real = server._MAX_SPAN_PAGES
-    server._MAX_SPAN_PAGES = 1
+    real = server._MAX_SPAN_PAGES, server._SPAN_FETCH_SIZE
+    server._MAX_SPAN_PAGES, server._SPAN_FETCH_SIZE = 1, 500
     try:
         out = export(fake=FakeLens(spans={"c1": usage_spans(600)}), call_sids="c1", out_name="e")
     finally:
-        server._MAX_SPAN_PAGES = real
+        server._MAX_SPAN_PAGES, server._SPAN_FETCH_SIZE = real
     assert out["calls_truncated"] == ["c1"] and out["rows"] == 500
 
 
@@ -247,6 +262,48 @@ def test_export_spans_jsonl_and_file_input():
     assert out["path"].endswith("f.jsonl") and out["calls_ok"] == 2  # duplicate id collapsed
     lines = [json.loads(line) for line in read_text(out["path"]).splitlines()]
     assert [r["call_id"] for r in lines] == ["c1", "c2"] and "metadata.text" not in lines[0]
+
+
+def test_export_spans_drops_a_key_withheld_on_any_row_from_every_row():
+    rows = [
+        span("llm.x", "llm.usage", 1, 0, "complete", 1.0, note="short"),
+        span("llm.x", "llm.usage", 2, 1, "complete", 1.0, note="n" * 70),
+    ]
+    out = export(fake=FakeLens(spans={"c1": rows}), call_sids="c1", out_name="mixed")
+    assert "metadata.note" not in out["columns"]
+    assert out["dropped_text_columns"] == ["metadata.note"]
+    assert "short" not in read_text(out["path"])
+    out = export(fake=FakeLens(spans={"c1": rows}), call_sids="c1", out_name="mj", format="jsonl")
+    assert all("metadata.note" not in json.loads(x) for x in read_text(out["path"]).splitlines())
+
+
+def test_export_spans_withholds_a_long_error_message_unless_include_text():
+    short = {**span("llm.x", "llm.error", 1, 0, "error"), "error_message": "TimeoutError"}
+    long = {**span("llm.x", "llm.error", 2, 1, "error"), "error_message": "user said " + "x" * 70}
+    fake = FakeLens(spans={"c1": [short], "c2": [long]})
+    out = export(fake=fake, call_sids="c1", out_name="err1")
+    assert "error_message" in out["columns"] and "dropped_text_columns" not in out
+    out = export(fake=fake, call_sids="c2", out_name="err2")
+    assert "error_message" not in out["columns"]
+    assert out["dropped_text_columns"] == ["error_message"]
+    out = export(fake=fake, call_sids="c2", out_name="err3", include_text=True)
+    assert "user said" in read_text(out["path"])
+
+
+def test_parallel_exports_get_distinct_files_and_leave_no_temp_files():
+    import asyncio
+
+    fake = FakeLens(spans={"c1": usage_spans(2)})
+
+    async def both():
+        return await asyncio.gather(
+            server._export_spans_core(ctx(), "c1"), server._export_spans_core(ctx(), "c1")
+        )
+
+    with patched(fake):
+        a, b = run(both())
+    assert a["path"] != b["path"] and os.path.exists(a["path"]) and os.path.exists(b["path"])
+    assert not [n for n in os.listdir(SCRATCH) if n.endswith((".tmp", ".jsonl")) and n[0] == "."]
 
 
 def test_export_spans_rejects_bad_input():
