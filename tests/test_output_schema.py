@@ -58,6 +58,8 @@ def test_structured_content_is_the_object_and_text_is_the_same_json():
     assert r.structuredContent == payload
     # Text-only clients read the same JSON value; the bytes differ (non-ASCII is unescaped).
     assert json.loads(r.content[0].text) == payload
+    assert "\n" not in r.content[0].text and ": " not in r.content[0].text  # compact, not indented
+    assert "namaste — hi" in r.content[0].text  # ensure_ascii=False: no \\u escapes
 
 
 def test_full_series_bypasses_the_overflow_summary():

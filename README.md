@@ -25,6 +25,37 @@ server-side)
 
 **Compare.** `compare_calls` · `compare_prompts` · `aggregate_calls` · `download_prompts`
 
+**Bulk analysis: export, don't read.** `export_spans` · `export_turn_latency` — page every call
+to one local file (0600, in `CLAUDE_SCRATCHPAD_DIR`) and return only the path, row counts and
+which calls failed or were truncated, so thousands of spans cost no context. Analyse the file
+with Bash. Conversation-text metadata keys (`text`, `transcript`, `message`, `prompt`, ...), any string
+over 64 characters and any dict or list value are dropped unless `include_text=True`; the result
+lists every withheld key in `dropped_text_columns`.
+
+`list_calls` cohort filters (`min_turns`, `min_duration_ms`): the newest calls are often still running (`total_turns` 0, no `duration_ms`), so set `start_time_to` an hour or so in the past. To page, always pass back the returned `next_offset` with `start_time_from_pinned` / `start_time_to_pinned` (the scan pins its window at the first request); on an older backend `offset` is a scan position in the unfiltered listing, not a match count.
+
+```text
+export_spans(call_sids="@/tmp/sids.txt", node="llm", event_name="llm.usage",
+             fields="turn_number,metadata.prompt_tokens,metadata.model")
+export_turn_latency(call_sids="sid1,sid2,sid3", max_turn=10)
+```
+
+The same code runs without an MCP client (needs `LENS_BASE_URL` and a cached login; prints the
+result as one JSON line):
+
+```bash
+uv --directory ~/.cache/lens-mcp/repo run lens-mcp export-spans sid1,sid2 --event-name llm.usage \
+    --fields turn_number,metadata.prompt_tokens --format jsonl
+uv --directory ~/.cache/lens-mcp/repo run lens-mcp export-turns @/tmp/sids.txt --max-turn 10
+```
+
+To read a little rather than export: `get_call_spans`, `search_spans` and `list_calls` take
+`fields="a,b,metadata.key"`; `get_call_spans` takes `event_name`; `list_calls` takes `min_turns`,
+`min_duration_ms` and `max_scan` (filtered by the backend where it supports it, else client-side; reports `server_filtered`, `scanned` / `scan_complete`).
+
+Page sizes follow the backend: whole-call span fetches ask for 5000 rows and cohort scans 200 calls per request (squadrun/lens#98). An older backend rejects those with 422, and the client drops to 500 / 100 for the rest of the process.
+Tool results are compact JSON, not indented.
+
 Two rules the tools enforce rather than merely document:
 
 - **Never compute a percentile from rows.** `get_call_spans` caps at 500 per page and
@@ -106,7 +137,8 @@ and degrade visibly, not silently, when the backend is older:
 ## Tests
 
 ```bash
-uv run python tests/test_stats.py
+for t in tests/test_*.py; do uv run python "$t" || exit 1; done
+uv run python tests/measure_tokens.py   # before/after size of tool responses (not a test)
 ```
 
 Covers the statistics helpers and the backend-skew detection — the only code here

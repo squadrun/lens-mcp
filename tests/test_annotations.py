@@ -1,4 +1,4 @@
-"""Every tool must ship annotations, and only the download_* three may be non-read-only.
+"""Every tool must ship annotations, and only the download_* and export_* tools may be non-read-only.
 
 Without annotations a client has to assume a tool can write, so every lens call
 stops for a permission prompt. This is the guard against that regressing.
@@ -15,7 +15,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lens_mcp.server import mcp
 
-WRITERS = {"download_entity_logs", "download_trace_logs", "download_prompts"}
+WRITERS = {
+    "download_entity_logs",
+    "download_trace_logs",
+    "download_prompts",
+    "export_spans",
+    "export_turn_latency",
+}
 
 TOOLS = asyncio.run(mcp.list_tools())
 
@@ -34,7 +40,9 @@ def test_nothing_is_destructive_and_everything_is_open_world():
     for t in TOOLS:
         a = t.annotations
         assert a.destructiveHint is False, f"{t.name} claims destructive"
-        assert a.idempotentHint is True, f"{t.name} is not marked idempotent"
+        # An export writes a new file per call, so only it may be non-idempotent.
+        idempotent = not t.name.startswith("export_")
+        assert a.idempotentHint is idempotent, f"{t.name} idempotentHint should be {idempotent}"
         assert a.openWorldHint is True, f"{t.name} is not marked open-world"
 
 

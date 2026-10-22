@@ -15,22 +15,27 @@ Env vars:
     LENS_API_KEY               — (optional) static API key fallback
 """
 
+import argparse
 import asyncio
 import base64
+import csv
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
-from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
+from collections.abc import Iterable
+from contextlib import asynccontextmanager, contextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 BASE_URL = os.environ.get("LENS_BASE_URL", "")
 if not BASE_URL:
@@ -45,8 +50,22 @@ try:
 except Exception:
     _VERSION = "unknown"
 
-_SPAN_PAGE_SIZE = 500  # server-side hard cap on /call/{id}/spans
-_MAX_SPAN_PAGES = 20  # 10k spans — beyond any real call, bounds runaway paging
+# /calls page for the cohort scan; each page re-runs the full dedup aggregation, so ask for the
+# most rows the server allows. The ext API allows 200 once squadrun/lens#98 is deployed and 100
+# before it: a 422 drops to the fallback for the rest of the process (see _get_capped).
+_CALLS_PAGE = 200
+_CALLS_PAGE_FALLBACK = 100
+_MAX_CALLS_SCAN = 1000
+_SPAN_PAGE_SIZE = 500  # get_call_spans page: the backend's default, sized for token cost
+# Whole-call fetches ask for the backend's per-call maximum. Paging /call/{id}/spans re-sorts the
+# call on every page and is not stable across equal timestamps; the backend measured no call above
+# 5000 spans, so one request per call is the normal case.
+# Older ext backends cap /call/{id}/spans at 500 (raised by squadrun/lens#98): same 422 fallback.
+_SPAN_FETCH_SIZE = 5000
+_SPAN_FETCH_FALLBACK = 500
+_MAX_SPANS_PER_CALL = 10_000  # beyond any real call, bounds runaway paging
+# Current per-request cap by kind; lowered once on a 422 from a backend that predates lens#98.
+_page_caps = {"spans": _SPAN_FETCH_SIZE, "calls": _CALLS_PAGE}
 _COHORT_CONCURRENCY = 8
 # A fleet-wide trace-log scan and a sort on a non-indexed span column both read/sort the whole
 # matched set. Safe over a short window; unbounded they pressure the box. Cap the window to 2h
@@ -231,6 +250,11 @@ READ_ONLY = ToolAnnotations(
 WRITES_LOCAL_FILES = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
+# The export_* tools write a new file on every call (the default name is unique), so a repeat
+# is not a no-op.
+EXPORTS_LOCAL_FILES = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
 
 
 def _client(ctx: Context) -> httpx.AsyncClient:
@@ -239,8 +263,17 @@ def _client(ctx: Context) -> httpx.AsyncClient:
 
 def _out(data: dict | list) -> dict[str, Any]:
     """A tool result as an object, so FastMCP sends it as structuredContent plus the same JSON
-    as text. Returning a str instead publishes it as one escaped string under "result"."""
-    return data if isinstance(data, dict) else {"result": data}
+    as text. Returning a str instead publishes it as one escaped string under "result".
+
+    The text is compact JSON: FastMCP's own rendering indents with two spaces, which costs
+    roughly a third more tokens on row-heavy payloads for no information. Returning a
+    CallToolResult makes FastMCP pass it through untouched; the tools keep their
+    `-> dict[str, Any]` annotation, so the published outputSchema is unchanged."""
+    payload = data if isinstance(data, dict) else {"result": data}
+    text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)], structuredContent=payload, isError=False
+    )
 
 
 async def _ensure_auth(ctx: Context) -> None:
@@ -366,6 +399,12 @@ get_call_spans returns at most 500 rows per request, search_spans at most 100.
 A p90 computed from one truncated page is wrong with no warning. Use
 aggregate_spans (single call) or aggregate_calls (cohort): both page to
 exhaustion and report `complete: false` if they could not.
+
+### Bulk analysis: export, don't read
+For more than a couple of calls, do not read spans into context. `export_spans` and
+`export_turn_latency` page every call to a local 0600 file and return only its path; analyse
+it with Bash. To read a little: `get_call_spans` / `search_spans` / `list_calls` take
+`fields="a,b,metadata.k"` and `get_call_spans` takes `event_name` (cheapest single-event read).
 
 ### Retention differs per table
 call_metadata 6 months · call_spans 30 days · call_prompts / call_configs 30 days
@@ -603,6 +642,8 @@ async def get_call_spans(
     phase: str = "",
     limit: int = 500,
     offset: int = 0,
+    event_name: str = "",
+    fields: str = "",
 ) -> dict[str, Any]:
     """Get structured instrumentation spans and events for a call.
 
@@ -628,6 +669,8 @@ async def get_call_spans(
         phase: Filter by phase (e.g. "error", "ttfb", "complete"). Useful for quick error checks.
         limit: Rows per page (default 500, which is also the server maximum).
         offset: Row offset, for paging past the first 500.
+        event_name: Exact event name (e.g. "llm.usage"). The cheapest way to read one event type — the server filters, so only those rows cost tokens.
+        fields: Comma-separated keys to keep per row (e.g. "turn_number,value_ms,metadata.prompt_tokens"). "metadata.<key>" picks one metadata key, flattened. Empty = whole rows. For many calls use export_spans instead.
     """
     call_sid = _sanitize_sid(call_sid)
     params: dict = {"limit": min(max(limit, 1), _SPAN_PAGE_SIZE), "offset": max(offset, 0)}
@@ -635,7 +678,11 @@ async def get_call_spans(
         params["node"] = node
     if phase:
         params["phase"] = phase
+    if event_name:
+        params["event_name"] = event_name
     data = await _get(ctx, f"/call/{call_sid}/spans", params=params)
+    if fields and "spans" in data:
+        data = {**data, "spans": _project_rows(data["spans"], _parse_fields(fields))}
     if data.get("has_more"):
         returned = len(data.get("spans", []))
         data = {
@@ -654,31 +701,48 @@ async def get_call_spans(
 
 
 async def _fetch_all_spans(
-    ctx: Context, call_sid: str, node: str = "", phase: str = ""
+    ctx: Context, call_sid: str, node: str = "", phase: str = "", event_name: str = ""
 ) -> tuple[list[dict], bool]:
-    """Page /call/{id}/spans to exhaustion. Returns (spans, complete).
+    """Fetch a call's spans to exhaustion. Returns (spans, complete).
 
-    A single response is capped at 500 rows and only advertises truncation via
-    has_more, so statistics computed from one unpaged response are silently wrong
-    on long calls. Paging is stable: rows come back in (turn_number, timestamp_ms)
-    order with no overlap between pages.
+    Asks for the backend's per-call maximum, so a call is one request. A further page is read
+    only past that; pages are ordered by timestamp_ms alone, so rows sharing a timestamp at a
+    page boundary can repeat or drop.
     """
-    base: dict = {"limit": _SPAN_PAGE_SIZE}
+    base: dict = {}
     if node:
         base["node"] = node
     if phase:
         base["phase"] = phase
+    if event_name:
+        base["event_name"] = event_name
 
     spans: list[dict] = []
     offset = 0
-    for _ in range(_MAX_SPAN_PAGES):
-        data = await _get(ctx, f"/call/{call_sid}/spans", params={**base, "offset": offset})
+    while len(spans) < _MAX_SPANS_PER_CALL:
+        params = {**base, "limit": _page_caps["spans"], "offset": offset}
+        data = await _get_capped(
+            ctx, f"/call/{call_sid}/spans", params, "spans", _SPAN_FETCH_FALLBACK
+        )
         page = data.get("spans", [])
         spans.extend(page)
         if not page or not data.get("has_more"):
             return spans, True
         offset += len(page)
     return spans, False
+
+
+async def _get_capped(ctx: Context, path: str, params: dict, kind: str, fallback: int) -> dict:
+    """GET with params["limit"] at the current cap for `kind`. A backend that predates
+    squadrun/lens#98 rejects the larger limit with 422: drop to `fallback` for the rest of the
+    process and retry once, so the tools work before and after that deploy."""
+    try:
+        return await _get(ctx, path, params=params)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 422 or params.get("limit", 0) <= fallback:
+            raise
+        _page_caps[kind] = fallback
+        return await _get(ctx, path, params={**params, "limit": fallback})
 
 
 def _percentile(ordered: list[float], p: float) -> float:
@@ -926,7 +990,7 @@ async def aggregate_spans(
     }
     if not complete:
         out["WARNING"] = (
-            f"Stopped after {_MAX_SPAN_PAGES * _SPAN_PAGE_SIZE} spans — statistics "
+            f"Stopped after {_MAX_SPANS_PER_CALL} spans — statistics "
             f"cover only that prefix of the call. Narrow with node/phase and re-run."
         )
     return _out(out)
@@ -1350,14 +1414,607 @@ async def download_trace_logs(call_sids: str, ctx: Context) -> str:
     return await _download_logs(ctx, call_sids, "traces", "traces", "trace logs")
 
 
+@contextmanager
+def _private_file(path: str):
+    """A text handle on a 0600 temp file beside path, renamed onto it on success, so a partial
+    write is never visible under the final path. The temp name is unique, so concurrent writers
+    of one path never share it; the last to finish wins."""
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            yield f
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
 def _write_private(path: str, text: str) -> int:
-    """Write text via a 0600 temp file + rename, so a partial write is never
-    visible under the final path. Returns the character count."""
-    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    """Write text to path through _private_file. Returns the character count."""
+    with _private_file(path) as f:
         f.write(text)
-    os.rename(path + ".tmp", path)
     return len(text)
+
+
+# ── Bulk export (write to a file, return the path — never the rows) ──
+
+_EXPORT_MAX_CALLS = 1000
+_EXPORT_CONCURRENCY = 4
+# Free-text metadata keys. Spans carry the live conversation here, so exports drop them unless
+# the caller opts in with include_text=True.
+_TEXT_KEYS = frozenset(
+    {
+        "text",
+        "transcript",
+        "message",
+        "content",
+        "last_user_message",
+        "prompt",
+        "user_text",
+        "llm_reply",
+    }
+)
+
+
+def _span_metadata(span: dict) -> dict:
+    """A span's metadata as a dict. The backend sends it as a JSON string; tolerate a dict."""
+    md = span.get("metadata")
+    if isinstance(md, dict):
+        return md
+    try:
+        parsed = json.loads(md or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_fields(spec: str) -> list[str]:
+    return [f.strip() for f in spec.split(",") if f.strip()]
+
+
+def _project_row(row: dict, fields: list[str]) -> dict:
+    """Keep only the requested keys of one row. "metadata.<key>" is read out of the metadata
+    JSON and emitted flattened under that same name; a key the row lacks is omitted."""
+    out: dict = {}
+    md: dict | None = None
+    for f in fields:
+        if f.startswith("metadata."):
+            if md is None:
+                md = _span_metadata(row)
+            key = f[len("metadata.") :]
+            if key in md:
+                out[f] = md[key]
+        elif f in row:
+            out[f] = row[f]
+    return out
+
+
+def _project_rows(rows: list, fields: list[str]) -> list:
+    return [_project_row(r, fields) if isinstance(r, dict) else r for r in rows]
+
+
+def _project_search(data: dict, fields: list[str]) -> dict:
+    """/search nests span rows under calls[].matches[]; project those, keep each call's envelope."""
+    calls = [
+        {**c, "matches": _project_rows(c["matches"], fields)} if "matches" in c else c
+        for c in data.get("calls", [])
+    ]
+    return {**data, "calls": calls}
+
+
+def _parse_sids(spec: str) -> list[str]:
+    """call_sids as a comma list, or "@/abs/path" naming a file with one SID per line."""
+    spec = spec.strip()
+    if spec.startswith("@"):
+        path = Path(spec[1:]).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"call_sids file must be an absolute path, got {spec[1:]!r}")
+        spec = path.read_text()
+    sids = list(dict.fromkeys(_sanitize_sid(s) for s in re.split(r"[,\s]+", spec) if s))
+    if not sids:
+        raise ValueError("call_sids is empty — pass a comma list or @/abs/path to a file")
+    if len(sids) > _EXPORT_MAX_CALLS:
+        raise ValueError(
+            f"{len(sids)} calls exceeds the {_EXPORT_MAX_CALLS}-call cap per export — "
+            f"split the list and export in batches."
+        )
+    return sids
+
+
+def _export_path(out_name: str, stem: str, ext: str) -> str:
+    scratchpad = os.environ.get("CLAUDE_SCRATCHPAD_DIR", tempfile.gettempdir())
+    if out_name:
+        if not re.fullmatch(r"[\w.\-]+", out_name):
+            raise ValueError(f"out_name must be a plain file name, got {out_name!r}")
+        name = out_name if out_name.endswith(f".{ext}") else f"{out_name}.{ext}"
+    else:
+        # Parallel tool calls land in the same second; the suffix keeps their files apart.
+        name = f"{stem}_{datetime.now(UTC):%Y%m%dT%H%M%S}_{secrets.token_hex(3)}.{ext}"
+    return os.path.join(scratchpad, name)
+
+
+def _cell(v: Any) -> Any:
+    if v is None:
+        return ""
+    if isinstance(v, dict | list | bool):
+        return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    return v
+
+
+def _write_csv(path: str, columns: list[str], rows: Iterable[dict]) -> None:
+    with _private_file(path) as f:
+        w = csv.DictWriter(f, columns, extrasaction="ignore", restval="", lineterminator="\n")
+        w.writeheader()
+        w.writerows({k: _cell(v) for k, v in r.items()} for r in rows)
+
+
+def _write_jsonl(path: str, columns: list[str], rows: Iterable[dict]) -> None:
+    with _private_file(path) as f:
+        for r in rows:
+            f.write(_jsonl_line({c: r[c] for c in columns if c in r}))
+
+
+def _jsonl_line(row: dict) -> str:
+    return json.dumps(row, separators=(",", ":"), ensure_ascii=False, default=str) + "\n"
+
+
+async def _per_call(sids: list[str], work) -> list[tuple[str, Any, str | None]]:
+    """Run work(sid) for every SID, four at a time. One failing call is reported, not raised."""
+    sem = asyncio.Semaphore(_EXPORT_CONCURRENCY)
+
+    async def one(sid: str):
+        async with sem:
+            try:
+                return sid, await work(sid), None
+            except Exception as e:
+                return sid, None, f"{type(e).__name__}: {e}"
+
+    return await asyncio.gather(*[one(s) for s in sids])
+
+
+_MAX_SHORT_TEXT = 64
+# Top-level span columns that are free text. error_message can quote what the caller said.
+_TEXT_COLUMNS = frozenset({"error_message"})
+
+
+def _withheld(key: str, value: Any) -> bool:
+    """Privacy default for include_text=False: the denylist, plus anything that could carry text.
+
+    Long strings and containers (messages arrays nest conversation text) are dropped; numbers,
+    bools, None and short strings (model ids, providers, voice ids) are kept.
+    """
+    if key.lower() in _TEXT_KEYS:
+        return True
+    if isinstance(value, dict | list):
+        return True
+    return isinstance(value, str) and len(value) > _MAX_SHORT_TEXT
+
+
+def _flatten_span(span: dict, include_text: bool, withheld: set[str] | None = None) -> dict:
+    """Flatten a span; with include_text=False, withheld metadata keys are added to `withheld`."""
+    flat = {}
+    for k, v in span.items():
+        if k == "metadata":
+            continue
+        if not include_text and k in _TEXT_COLUMNS and _withheld(k, v):
+            if withheld is not None:
+                withheld.add(k)
+            continue
+        flat[k] = v
+    for k, v in _span_metadata(span).items():
+        if include_text or not _withheld(k, v):
+            flat[f"metadata.{k}"] = v
+        elif withheld is not None:
+            withheld.add(f"metadata.{k}")
+    return flat
+
+
+async def _export_spans_core(
+    ctx: Context,
+    call_sids: str,
+    node: str = "",
+    phase: str = "",
+    event_name: str = "",
+    fields: str = "",
+    format: str = "csv",
+    include_text: bool = False,
+    out_name: str = "",
+) -> dict:
+    if format not in ("csv", "jsonl"):
+        raise ValueError(f'format must be "csv" or "jsonl", got {format!r}')
+    sids = _parse_sids(call_sids)
+    wanted = _parse_fields(fields)
+    path = _export_path(out_name, "spans", format)
+    await _ensure_auth(ctx)
+
+    withheld: set[str] = set()
+    seen: dict[str, None] = {}  # every column written, in first-seen order
+
+    # Rows stream to a private staging file as each call finishes, so memory holds at most
+    # _EXPORT_CONCURRENCY calls. Which keys are withheld is only known at the end, so the final
+    # file is written from the staging file in a second pass.
+    fd, stage_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".spans_", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w+") as stage:
+
+            async def work(sid: str):
+                spans, complete = await _fetch_all_spans(
+                    ctx, sid, node=node, phase=phase, event_name=event_name
+                )
+                # No await from here on, so concurrent calls never interleave their rows.
+                for s in spans:
+                    flat = {"call_id": sid, **_flatten_span(s, include_text, withheld)}
+                    if wanted:
+                        flat = {k: flat[k] for k in ("call_id", *wanted) if k in flat}
+                    seen.update(dict.fromkeys(flat))
+                    stage.write(_jsonl_line(flat))
+                return len(spans), complete
+
+            n_rows, ok, failed, truncated = 0, 0, [], []
+            for sid, res, err in await _per_call(sids, work):
+                if err:
+                    failed.append({"call_id": sid, "error": err})
+                    continue
+                ok += 1
+                n, complete = res
+                n_rows += n
+                if not complete:
+                    truncated.append(sid)
+
+            # A key withheld on any row is dropped from every row, so a column is never
+            # partly blank.
+            dropped: set[str] = set(withheld)
+            if wanted:
+                if not include_text:
+                    dropped |= {
+                        f
+                        for f in wanted
+                        if f.startswith("metadata.") and f[9:].lower() in _TEXT_KEYS
+                    }
+                columns = ["call_id"] + [f for f in wanted if f not in dropped]
+            else:
+                columns = ["call_id"] + [c for c in seen if c != "call_id" and c not in dropped]
+
+            out = {"path": None, "rows": n_rows, "columns": columns}
+            if ok:
+                stage.seek(0)
+                rows = (json.loads(line) for line in stage)
+                (_write_csv if format == "csv" else _write_jsonl)(path, columns, rows)
+                out["path"] = path
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(stage_path)
+    out.update(calls_ok=ok, calls_failed=failed, calls_truncated=truncated)
+    if dropped:
+        out["dropped_text_columns"] = sorted(dropped)
+    return out
+
+
+@mcp.tool(annotations=EXPORTS_LOCAL_FILES)
+async def export_spans(
+    call_sids: str,
+    ctx: Context,
+    node: str = "",
+    phase: str = "",
+    event_name: str = "",
+    fields: str = "",
+    format: str = "csv",
+    include_text: bool = False,
+    out_name: str = "",
+) -> dict[str, Any]:
+    """Export spans from many calls to ONE local file; returns the path, never the rows.
+
+    Use this instead of get_call_spans / search_spans whenever you want to analyse spans
+    across more than a couple of calls: the rows go to disk, so none of them cost context
+    tokens. Then work on the file with Bash (python, duckdb, awk). Each call is read whole,
+    so the file is complete unless the call appears in calls_truncated. Rows are grouped by
+    call, in the order the calls finish.
+
+    Privacy: unless include_text=True, metadata keys that hold conversation text (text,
+    transcript, message, content, last_user_message, prompt, user_text, llm_reply) are dropped,
+    and so is any metadata value that is a string over 64 characters or a dict/list (they can
+    nest conversation text). A long error_message is withheld the same way. Numbers, bools,
+    None and short strings are kept. A key withheld on any row is dropped from every row, and
+    every withheld key is listed in dropped_text_columns, including keys requested via fields.
+    The file is written 0600 into CLAUDE_SCRATCHPAD_DIR (default: the system temp dir).
+
+    Args:
+        call_sids: Comma-separated call SIDs, or "@/abs/path" naming a file with one SID per
+            line. At most 1000 calls per invocation.
+        node: Node PREFIX filter (e.g. "llm", "tts.cartesia"). Narrow it — it is the cheapest filter.
+        phase: Phase filter (e.g. "ttfb", "error").
+        event_name: Exact event name (e.g. "llm.usage"). Filtered by the server.
+        fields: Comma-separated columns; "metadata.<key>" selects a metadata key. Empty = every
+            top-level key plus every metadata key, flattened as metadata.<key>.
+        format: "csv" (default) or "jsonl".
+        include_text: Keep the metadata the privacy rule above would withhold.
+        out_name: File name inside the scratchpad dir (default spans_<UTC timestamp>_<random>.<format>).
+    """
+    return _out(
+        await _export_spans_core(
+            ctx, call_sids, node, phase, event_name, fields, format, include_text, out_name
+        )
+    )
+
+
+# ── Per-turn latency export (turn logic ported from the first-sentence study) ──
+
+
+def _tsms(v: Any) -> float:
+    """Epoch ms from an ISO string (naive = UTC) or a numeric ms."""
+    if isinstance(v, int | float):
+        return float(v)
+    d = datetime.fromisoformat(str(v).strip().replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=UTC)
+    return d.timestamp() * 1000.0
+
+
+def _iso_ms(v: Any) -> str:
+    ms = _tsms(v)
+    d = datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{round(ms) % 1000:03d}"
+
+
+def _numstr(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and x == int(x):
+        return str(int(x))
+    return str(x)
+
+
+def _num_or_none(v: Any):
+    return v if isinstance(v, int | float) and not isinstance(v, bool) else None
+
+
+def _prep_spans(spans: list[dict]) -> list[dict]:
+    """Normalise raw span rows and order them by time. Rows without a timestamp or a
+    turn_number cannot be placed in a turn and are skipped."""
+    out = []
+    for i, s in enumerate(spans):
+        if s.get("timestamp_ms") is None or s.get("turn_number") is None:
+            continue
+        try:
+            ts = _tsms(s["timestamp_ms"])
+        except ValueError:
+            continue
+        out.append(
+            {
+                "node": s.get("node") or "",
+                "phase": s.get("phase"),
+                "event_name": s.get("event_name"),
+                "value_ms": s.get("value_ms"),
+                "ts": ts,
+                "turn": int(s["turn_number"]),
+                "idx": i,
+                "md": _span_metadata(s),
+            }
+        )
+    out.sort(key=lambda r: (r["ts"], r["idx"]))
+    return out
+
+
+def _tts_family(node: str) -> str | None:
+    n = (node or "").lower()
+    if "cartesia" in n:
+        return "cartesia"
+    if "elevenlabs" in n:
+        return "elevenlabs"
+    return None
+
+
+def _turn_rows(
+    call_id: str,
+    llm: list[dict],
+    tts: list[dict],
+    react: list[dict],
+    tool: list[dict],
+    max_turn: int = 10,
+) -> list[dict]:
+    """One row per turn that has an LLM ttfb, a TTS first-audio and a reaction-time span.
+
+    Rules (each came out of a case that gave a wrong number):
+    - The turn's LLM request is the EARLIEST llm ttfb span; n_llm_requests counts them all.
+    - First audio is the first tts.first_audio ttfb span at or after that request.
+    - A turn is dropped unless the reaction span lands within 6s of the LLM request.
+    - Sentence fields (sent_*, n_pieces) are read only from TTS events at or after the request,
+      per provider: Cartesia emits tts.text_sent plus tts.chunk_cache pieces sharing a
+      synthesis_seq; ElevenLabs emits tts.chunk_cache pieces (one sentence = all pieces of the
+      first synthesis_seq) or, without a cache, tts.segment_sent.
+    - lead_silence_ms comes from the ttfa-phase first_audio of the turn.
+    - tool_in_turn is 1 if any tool span carries that turn_number.
+    """
+    llm = [r for r in _prep_spans(llm) if r["phase"] == "ttfb" and r["node"].startswith("llm")]
+    tts = _prep_spans(tts)
+    react = _prep_spans(react)
+    tools = _prep_spans(tool)
+    rows = []
+    for T in range(1, max_turn + 1):
+        A = [r for r in llm if r["turn"] == T]
+        if not A:
+            continue
+        a = A[0]
+        fas = [
+            r
+            for r in tts
+            if r["turn"] == T
+            and r["event_name"] == "tts.first_audio"
+            and r["phase"] == "ttfb"
+            and r["ts"] >= a["ts"]
+        ]
+        if not fas:
+            continue
+        fa = fas[0]
+        fam = _tts_family(fa["node"])
+        C = [r for r in react if r["turn"] == T and r["node"] == "pipeline.bot_reaction_time"]
+        if not C:
+            continue
+        c = C[0]
+        if c["ts"] - a["ts"] >= 6000:
+            continue
+        ttfa = [
+            r
+            for r in tts
+            if r["turn"] == T
+            and r["event_name"] == "tts.first_audio"
+            and r["phase"] == "ttfa"
+            and r["ts"] >= a["ts"]
+        ]
+        lead = _num_or_none(ttfa[0]["md"].get("leading_silence_ms")) if ttfa else None
+        sent_ts = sent_chars = n_pieces = None
+        evs = [r for r in tts if r["turn"] == T and r["ts"] >= a["ts"]]
+        cc = [
+            r for r in evs if r["event_name"] == "tts.chunk_cache" and _tts_family(r["node"]) == fam
+        ]
+        if fam == "cartesia":
+            sent = [
+                r
+                for r in evs
+                if r["event_name"] == "tts.text_sent" and _tts_family(r["node"]) == "cartesia"
+            ]
+            if sent:
+                m = sent[0]["md"]
+                chars = _num_or_none(m.get("char_count"))
+                if chars is None and isinstance(m.get("text"), str):
+                    chars = len(m["text"])
+                sent_ts, sent_chars = _iso_ms(sent[0]["ts"]), chars
+            if cc:
+                seq = cc[0]["md"].get("synthesis_seq")
+                if seq is not None:
+                    n_pieces = sum(1 for r in cc if r["md"].get("synthesis_seq") == seq)
+        elif fam == "elevenlabs":
+            seg = [
+                r
+                for r in evs
+                if r["event_name"] == "tts.segment_sent" and _tts_family(r["node"]) == fam
+            ]
+
+            def chn(r):
+                m = r["md"]
+                v = _num_or_none(m.get("characters"))
+                return v if v is not None else _num_or_none(m.get("chars"))
+
+            if cc:
+                seq = cc[0]["md"].get("synthesis_seq")
+                if seq is not None:
+                    piece = [r for r in cc if r["md"].get("synthesis_seq") == seq]
+                    vals = [chn(r) for r in piece]
+                    if all(v is not None for v in vals):
+                        sent_chars = sum(vals)
+                    sent_ts, n_pieces = _iso_ms(min(r["ts"] for r in piece)), len(piece)
+                else:
+                    sent_chars, sent_ts, n_pieces = chn(cc[0]), _iso_ms(cc[0]["ts"]), 1
+            elif seg:
+                sent_chars, sent_ts, n_pieces = chn(seg[0]), _iso_ms(seg[0]["ts"]), 1
+        ch = fa["md"].get("cache_hit")
+        rows.append(
+            {
+                "call_id": call_id,
+                "turn": T,
+                "llm_node": a["node"],
+                "llm_model": a["md"].get("model") or "",
+                "n_llm_requests": len(A),
+                "ttfb_ms": _numstr(a["value_ms"]),
+                "ttfb_ts": _iso_ms(a["ts"]),
+                "sent_ts": sent_ts or "",
+                "sent_chars": _numstr(sent_chars),
+                "n_pieces": _numstr(n_pieces),
+                "tts_provider": fam or fa["node"].removeprefix("tts."),
+                "fa_ts": _iso_ms(fa["ts"]),
+                "fa_ttfb_ms": _numstr(fa["value_ms"]),
+                "cache_hit": "" if ch is None else ("true" if ch else "false"),
+                "lead_silence_ms": _numstr(lead),
+                "reaction_ms": _numstr(c["value_ms"]),
+                "reaction_ts": _iso_ms(c["ts"]),
+                "tool_in_turn": 1 if any(r["turn"] == T for r in tools) else 0,
+            }
+        )
+    return rows
+
+
+_TURN_COLUMNS = [
+    "call_id", "turn", "llm_node", "llm_model", "n_llm_requests", "ttfb_ms", "ttfb_ts",
+    "sent_ts", "sent_chars", "n_pieces", "tts_provider", "fa_ts", "fa_ttfb_ms", "cache_hit",
+    "lead_silence_ms", "reaction_ms", "reaction_ts", "tool_in_turn",
+]  # fmt: skip
+
+
+async def _export_turns_core(
+    ctx: Context, call_sids: str, max_turn: int = 10, out_name: str = ""
+) -> dict:
+    sids = _parse_sids(call_sids)
+    max_turn = max(max_turn, 1)
+    path = _export_path(out_name, "turn_latency", "csv")
+    await _ensure_auth(ctx)
+
+    async def work(sid: str):
+        parts, complete = [], True
+        for node, phase in (
+            ("llm", "ttfb"),
+            ("tts", ""),
+            ("pipeline.bot_reaction_time", ""),
+            ("tool", ""),
+        ):
+            spans, ok = await _fetch_all_spans(ctx, sid, node=node, phase=phase)
+            parts.append(spans)
+            complete = complete and ok
+        llm, tts, react, tool = parts
+        return _turn_rows(sid, llm, tts, react, tool, max_turn), llm, complete
+
+    rows: list[dict] = []
+    ok, failed, truncated = 0, [], []
+    served: dict[str, set[str]] = {}
+    for sid, res, err in await _per_call(sids, work):
+        if err:
+            failed.append({"call_id": sid, "error": err})
+            continue
+        ok += 1
+        turn_rows, llm, complete = res
+        if not complete:
+            truncated.append(sid)
+        rows.extend(turn_rows)
+        for s in llm:
+            if s.get("phase") == "ttfb" and (s.get("node") or "").startswith("llm"):
+                model = _span_metadata(s).get("model") or "unknown"
+                served.setdefault(f"{s['node']}/{model}", set()).add(sid)
+
+    out = {"path": None, "rows": len(rows), "columns": _TURN_COLUMNS}
+    if ok:
+        _write_csv(path, _TURN_COLUMNS, rows)
+        out["path"] = path
+    out.update(calls_ok=ok, calls_failed=failed, calls_truncated=truncated)
+    out["served_llm"] = {k: len(v) for k, v in sorted(served.items())}
+    return out
+
+
+@mcp.tool(annotations=EXPORTS_LOCAL_FILES)
+async def export_turn_latency(
+    call_sids: str, ctx: Context, max_turn: int = 10, out_name: str = ""
+) -> dict[str, Any]:
+    """Export one CSV row per conversational turn with LLM, TTS and reaction timings.
+
+    Per call it pages the LLM ttfb, TTS, pipeline.bot_reaction_time and tool spans and joins
+    them by turn_number, so the file answers "how long until the caller heard the first
+    sentence, and what served it" without reading a span. Returns the path, never the rows.
+    Turns missing an LLM ttfb, a TTS first-audio or a reaction span are skipped.
+
+    Columns: call_id, turn, llm_node, llm_model, n_llm_requests, ttfb_ms, ttfb_ts, sent_ts,
+    sent_chars, n_pieces (first sentence as sent to TTS), tts_provider, fa_ts, fa_ttfb_ms,
+    cache_hit, lead_silence_ms, reaction_ms, reaction_ts, tool_in_turn. sent_* are filled for
+    Cartesia and ElevenLabs only. The result also has served_llm: llm node/model -> number of
+    calls that used it. Note turn_number counts utterances, not user turns.
+
+    Args:
+        call_sids: Comma-separated call SIDs, or "@/abs/path" naming a file with one SID per
+            line. At most 1000 calls per invocation.
+        max_turn: Highest turn_number to export (default 10).
+        out_name: File name inside the scratchpad dir (default turn_latency_<UTC timestamp>_<random>.csv).
+    """
+    return _out(await _export_turns_core(ctx, call_sids, max_turn, out_name))
 
 
 async def _get_or_none(ctx: Context, path: str) -> dict | None:
@@ -1486,6 +2143,7 @@ async def search_spans(
     time_from: str = "",
     time_to: str = "",
     limit: int = 50,
+    fields: str = "",
 ) -> dict[str, Any]:
     """Search structured spans across all calls using indexed columns.
 
@@ -1538,6 +2196,7 @@ async def search_spans(
         time_from: ISO8601 start time (alternative to time_range_minutes).
         time_to: ISO8601 end time.
         limit: Max results (default 50, max 100).
+        fields: Comma-separated keys to keep per matched span; "metadata.<key>" picks one metadata key, flattened. Empty = whole rows. Call-level keys (call_id, totals) are always kept.
     """
     if metadata_filter and not node:
         raise ValueError(
@@ -1594,6 +2253,8 @@ async def search_spans(
             ),
             **data,
         }
+    if fields:
+        data = _project_search(data, _parse_fields(fields))
     return _out(data)
 
 
@@ -1614,6 +2275,13 @@ async def list_calls(
     start_time_from: str = "",
     start_time_to: str = "",
     limit: int = 20,
+    offset: int = 0,
+    agent_id: str = "",
+    pipecat_version: str = "",
+    fields: str = "",
+    min_turns: int = 0,
+    min_duration_ms: int = 0,
+    max_scan: int = 300,
 ) -> dict[str, Any]:
     """List calls from call_metadata with structured filters.
 
@@ -1639,9 +2307,29 @@ async def list_calls(
         time_range_minutes: Look back N minutes (default 60, max 10080 = 7 days). For older calls, use start_time_from/to instead.
         start_time_from: ISO8601 start time (alternative to time_range_minutes). No cap — use for calls older than 7 days.
         start_time_to: ISO8601 end time.
-        limit: Max results (default 20, max 100).
+        limit: Max results (default 20, max 100). With min_turns / min_duration_ms, the max number of matching calls returned.
+        offset: Row offset into the listing. With min_turns / min_duration_ms, always continue
+            with the returned next_offset plus start_time_from_pinned / start_time_to_pinned
+            (the scan pins its window at the first request): on a backend that filters
+            server-side (server_filtered=true) offset counts matching calls, otherwise it is a
+            scan position in the unfiltered listing, so offset=<number of matches> re-reads rows.
+        agent_id: Filter by agent ID.
+        pipecat_version: Filter by the pipeline framework version the call ran on.
+        fields: Comma-separated keys to keep per call (e.g. "call_id,duration_ms,total_turns"). Empty = whole rows.
+        min_turns: Keep only calls with at least this many total_turns. Sent to the backend, which filters server-side when it supports it (squadrun/lens#98; the result says server_filtered); otherwise the listing is paged and filtered here.
+        min_duration_ms: Keep only calls at least this long. Same as min_turns.
+            Warning: the newest calls are often still running and show total_turns 0 and no
+            duration_ms, so min_turns / min_duration_ms can match nothing on a window ending "now".
+            Set start_time_to an hour or so in the past to skip them.
+        max_scan: With a min_* filter, the most listing rows to scan (default 300, cap 1000). The result reports scanned, matched and scan_complete — if scan_complete is false the list may be missing matches; narrow the time window or raise max_scan.
     """
     params: dict = {"limit": min(limit, 100)}
+    if offset > 0:
+        params["offset"] = offset
+    if agent_id:
+        params["agent_id"] = agent_id
+    if pipecat_version:
+        params["pipecat_version"] = pipecat_version
     if campaign_id:
         params["campaign_id"] = campaign_id
     if voice_mission_id:
@@ -1668,7 +2356,78 @@ async def list_calls(
         params["time_range_minutes"] = min(time_range_minutes, 10080)
     if start_time_to:
         params["start_time_to"] = start_time_to
-    return _out(await _get(ctx, "/calls", params=params))
+    wanted = _parse_fields(fields)
+    if min_turns <= 0 and min_duration_ms <= 0:
+        data = await _get(ctx, "/calls", params=params)
+        if wanted:
+            data = {**data, "calls": _project_rows(data.get("calls", []), wanted)}
+        return _out(data)
+
+    cap = min(max(max_scan, 1), _MAX_CALLS_SCAN)
+    keep = min(max(limit, 1), 100)
+    # Pin the window at the first request, so calls arriving mid-scan cannot push rows down
+    # between pages and a relative window cannot slide. Pass the reported
+    # start_time_from_pinned / start_time_to_pinned back with next_offset to continue.
+    pinned_to = pinned_from = ""
+    if not start_time_to:
+        now = datetime.now(UTC)
+        pinned_to = params["start_time_to"] = now.isoformat(timespec="seconds")
+        if "time_range_minutes" in params:
+            minutes = params.pop("time_range_minutes")
+            pinned_from = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+            params["start_time_from"] = pinned_from
+    # Backends with squadrun/lens#98 filter these server-side and say so in filters_applied;
+    # older ones ignore the params, and the client-side check below does the work.
+    if min_turns > 0:
+        params["min_turns"] = min_turns
+    if min_duration_ms > 0:
+        params["min_duration_ms"] = min_duration_ms
+    server_filtered = False
+    matched: list[dict] = []
+    seen: set[str] = set()
+    scanned, pos, complete = 0, max(offset, 0), False
+    while scanned < cap:
+        page_size = min(_page_caps["calls"], cap - scanned)
+        data = await _get_capped(
+            ctx,
+            "/calls",
+            {**params, "limit": page_size, "offset": pos},
+            "calls",
+            _CALLS_PAGE_FALLBACK,
+        )
+        page_size = min(page_size, _page_caps["calls"])  # what was actually asked for
+        server_filtered = bool(data.get("filters_applied"))
+        rows = data.get("calls", [])
+        scanned += len(rows)
+        pos += len(rows)
+        for r in rows:
+            # Calls starting mid-scan shift the newest-first listing down, so a row can come
+            # back on the next page.
+            if r.get("call_id") in seen:
+                continue
+            seen.add(r.get("call_id"))
+            if (r.get("total_turns") or 0) >= min_turns and (
+                r.get("duration_ms") or 0
+            ) >= min_duration_ms:
+                matched.append(r)
+        if len(rows) < page_size:
+            complete = True
+            break
+        if len(matched) >= keep:
+            break
+    shown = matched[:keep]
+    return _out(
+        {
+            "calls": _project_rows(shown, wanted) if wanted else shown,
+            "scanned": scanned,
+            "matched": len(matched),
+            "scan_complete": complete,
+            "next_offset": None if complete else pos,
+            "server_filtered": server_filtered,
+            "start_time_from_pinned": pinned_from or None,
+            "start_time_to_pinned": pinned_to or None,
+        }
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2514,7 +3273,69 @@ async def _ensure_auth_before_serve():
     return await _run_auth()
 
 
+class _CliContext:
+    """Just enough of Context for _get / _ensure_auth outside a running MCP server."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.request_context = SimpleNamespace(
+            lifespan_context={"client": client, "authenticated": False}
+        )
+
+
+def _build_cli() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="lens-mcp", description="Bulk exports without an MCP client.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("export-spans", help="export spans from many calls to one file")
+    sp.add_argument("call_sids", help='comma list, or "@/abs/path" with one SID per line')
+    sp.add_argument("--node", default="")
+    sp.add_argument("--phase", default="")
+    sp.add_argument("--event-name", default="")
+    sp.add_argument("--fields", default="")
+    sp.add_argument("--format", default="csv", choices=["csv", "jsonl"])
+    sp.add_argument("--include-text", action="store_true")
+    sp.add_argument("--out-name", default="")
+    tp = sub.add_parser("export-turns", help="export per-turn latency rows to one CSV")
+    tp.add_argument("call_sids", help='comma list, or "@/abs/path" with one SID per line')
+    tp.add_argument("--max-turn", type=int, default=10)
+    tp.add_argument("--out-name", default="")
+    return ap
+
+
+async def _run_cli(args: argparse.Namespace) -> dict:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT) as client:
+        ctx = _CliContext(client)
+        if args.cmd == "export-spans":
+            return await _export_spans_core(
+                ctx,
+                args.call_sids,
+                args.node,
+                args.phase,
+                args.event_name,
+                args.fields,
+                args.format,
+                args.include_text,
+                args.out_name,
+            )
+        return await _export_turns_core(ctx, args.call_sids, args.max_turn, args.out_name)
+
+
+def _cli(argv: list[str]) -> int:
+    args = _build_cli().parse_args(argv)
+    if not BASE_URL:
+        print("Error: LENS_BASE_URL is required.", file=sys.stderr)
+        return 1
+    try:
+        result = asyncio.run(_run_cli(args))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False, default=str))
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("export-spans", "export-turns"):
+        sys.exit(_cli(sys.argv[1:]))
     if len(sys.argv) > 1 and sys.argv[1] == "auth":
         asyncio.run(_run_auth())
     elif len(sys.argv) > 1 and sys.argv[1] == "serve":
