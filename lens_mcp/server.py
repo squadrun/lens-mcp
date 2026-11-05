@@ -239,7 +239,46 @@ async def lifespan(server: FastMCP):
         yield {"client": client, "authenticated": False}
 
 
-mcp = FastMCP("lens", lifespan=lifespan)
+# Clients put this in the model's context when the server connects, before any
+# tool call, so it carries only what a model needs to choose a tool and to not
+# trust a number it cannot see is wrong. The full semantics stay in _CLIENT_NOTES.
+# Backticks mark tool names; tests/test_instructions.py checks each one exists.
+_SERVER_INSTRUCTIONS = """\
+Lens reads voice-bot call telemetry: call metadata, spans, prompts, configs, \
+entity-extraction logs and trace logs.
+
+Call `get_schema` before computing any number. Its client notes give the \
+semantics that silently produce wrong answers: turn_number, row caps, \
+retention per table, metadata_filter scope.
+
+Pick the tool by the question:
+- Measure a population: `latency_breakdown` (per-node percentiles), \
+`latency_over_time`, `error_counts_over_time` and `event_counts_over_time` \
+(trends), `tool_outcomes` (each tool's success rate and duration), \
+`count_spans` (a count), `slowest_calls` (a ranking).
+- Find calls: `list_calls`; put two side by side with `compare_calls`.
+- Explain one call: `get_call_spans` (its waterfall), `aggregate_spans` \
+(statistics over it), `get_call_config`, `get_call_trace_logs`.
+- Search log text across calls: `search_trace_logs`.
+- Analyse many calls: `export_spans` and `export_turn_latency` write a local \
+file; analyse that file instead of reading spans into context.
+- Check a filter value before using it: `list_filter_values`.
+
+Limits that an error does not explain:
+- `count_spans` takes at most one day per call; a wider window returns a bare \
+400. Count one day per call and add the results, or use \
+`event_counts_over_time` for a daily series.
+- `search_trace_logs` without campaign_id covers at most 2 hours.
+- `list_filter_values` lists only values seen in the last 7 days. A value \
+missing there can still exist in older data.
+- Never take a percentile from one page of `get_call_spans` or \
+`search_spans`. Use `aggregate_spans` or `aggregate_calls`, and check their \
+completeness flags.
+- Percentiles do not add: per-stage medians do not sum to the end-to-end \
+median. Perceived latency is the pipeline.bot_reaction_time node.
+"""
+
+mcp = FastMCP("lens", instructions=_SERVER_INSTRUCTIONS, lifespan=lifespan)
 
 # openWorldHint is True throughout: every tool hits the remote Lens API.
 READ_ONLY = ToolAnnotations(
