@@ -257,8 +257,10 @@ Pick the tool by the question:
 (trends), `tool_outcomes` (each tool's success rate and duration), \
 `count_spans` (a count), `slowest_calls` (a ranking).
 - Find calls: `list_calls`; put two side by side with `compare_calls`.
+- Find spans by node or event across calls: `search_spans`.
 - Explain one call: `get_call_spans` (its waterfall), `aggregate_spans` \
-(statistics over it), `get_call_config`, `get_call_trace_logs`.
+(statistics over it), `get_call_config`, `get_call_transcript`, \
+`get_call_trace_logs`.
 - Search log text across calls: `search_trace_logs`.
 - Analyse many calls: `export_spans` and `export_turn_latency` write a local \
 file; analyse that file instead of reading spans into context.
@@ -2485,8 +2487,8 @@ async def count_spans(
     indexed columns, no row data transferred.
 
     Without campaign_id, agent_config_id or prompt_ref the window is at most one
-    day: count one day per call and add, or use event_counts_over_time for a
-    daily series.
+    day: count one day per call and add the span counts. Affected calls do not
+    add, since one call can cross a day boundary.
 
     Args:
         node: Node prefix filter (e.g. "llm.", "tool.").
@@ -2502,11 +2504,12 @@ async def count_spans(
     """
     if not (campaign_id or agent_config_id or prompt_ref):
         window = _window_minutes(0 if time_from else time_range_minutes, time_from, time_to)
-        if window is not None and window > _UNSCOPED_COUNT_WINDOW_CAP_MIN:
+        # int(): a time_from exactly a day back has aged a few seconds by now.
+        if window is not None and int(window) > _UNSCOPED_COUNT_WINDOW_CAP_MIN:
             raise ValueError(
                 f"count_spans without campaign_id, agent_config_id or prompt_ref is bounded "
-                f"to {_UNSCOPED_COUNT_WINDOW_CAP_MIN} minutes (one day). Count one day per "
-                f"call and add the results, or use event_counts_over_time for a daily series."
+                f"to {_UNSCOPED_COUNT_WINDOW_CAP_MIN} minutes (one day). Pass one of those "
+                f"filters, or count one day per call and add the span counts."
             )
     params: dict = {}
     if node:
