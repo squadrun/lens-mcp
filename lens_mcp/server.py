@@ -71,6 +71,10 @@ _COHORT_CONCURRENCY = 8
 # matched set. Safe over a short window; unbounded they pressure the box. Cap the window to 2h
 # unless a high-selectivity filter (campaign_id/agent_config_id/prompt_ref) narrows first.
 _UNSCOPED_WINDOW_CAP_MIN = 120
+# /search/count refuses an unscoped window over one day with a bare 400 (checked
+# 2026-11-05: 1440 min -> 200, 1500 -> 400; campaign_id, agent_config_id or prompt_ref at
+# 2880 -> 200). Checked here so the caller learns why.
+_UNSCOPED_COUNT_WINDOW_CAP_MIN = 1440
 _HIGH_SELECTIVITY = ("campaign_id", "agent_config_id", "prompt_ref")
 
 
@@ -239,17 +243,13 @@ async def lifespan(server: FastMCP):
         yield {"client": client, "authenticated": False}
 
 
-# Clients put this in the model's context when the server connects, before any
-# tool call, so it carries only what a model needs to choose a tool and to not
-# trust a number it cannot see is wrong. The full semantics stay in _CLIENT_NOTES.
-# Backticks mark tool names; tests/test_instructions.py checks each one exists.
+# Clients show this before any tool call, often with only tool names loaded, so
+# it carries what a model needs to choose a tool. Limits live with their tool,
+# and the semantics in _CLIENT_NOTES. Backticks mark tool names;
+# tests/test_instructions.py checks each one exists.
 _SERVER_INSTRUCTIONS = """\
-Lens reads voice-bot call telemetry: call metadata, spans, prompts, configs, \
-entity-extraction logs and trace logs.
-
-Call `get_schema` before computing any number. Its client notes give the \
-semantics that silently produce wrong answers: turn_number, row caps, \
-retention per table, metadata_filter scope.
+Call `get_schema` before computing a number from spans or trace logs: its \
+client notes give the semantics that silently produce wrong answers.
 
 Pick the tool by the question:
 - Measure a population: `latency_breakdown` (per-node percentiles), \
@@ -264,18 +264,8 @@ Pick the tool by the question:
 file; analyse that file instead of reading spans into context.
 - Check a filter value before using it: `list_filter_values`.
 
-Limits that an error does not explain:
-- `count_spans` takes at most one day per call; a wider window returns a bare \
-400. Count one day per call and add the results, or use \
-`event_counts_over_time` for a daily series.
-- `search_trace_logs` without campaign_id covers at most 2 hours.
-- `list_filter_values` lists only values seen in the last 7 days. A value \
-missing there can still exist in older data.
-- Never take a percentile from one page of `get_call_spans` or \
-`search_spans`. Use `aggregate_spans` or `aggregate_calls`, and check their \
-completeness flags.
-- Percentiles do not add: per-stage medians do not sum to the end-to-end \
-median. Perceived latency is the pipeline.bot_reaction_time node.
+Never take a percentile from raw span rows; use `aggregate_spans` or \
+`aggregate_calls`.
 """
 
 mcp = FastMCP("lens", instructions=_SERVER_INSTRUCTIONS, lifespan=lifespan)
@@ -438,6 +428,11 @@ get_call_spans returns at most 500 rows per request, search_spans at most 100.
 A p90 computed from one truncated page is wrong with no warning. Use
 aggregate_spans (single call) or aggregate_calls (cohort): both page to
 exhaustion and report `complete: false` if they could not.
+
+### Percentiles do not add
+Per-stage medians from latency_breakdown do not sum to the end-to-end median, so
+subtracting them does not measure overhead. Perceived latency — how long the
+person waited for the bot to start answering — is pipeline.bot_reaction_time.
 
 ### Bulk analysis: export, don't read
 For more than a couple of calls, do not read spans into context. `export_spans` and
@@ -2489,6 +2484,10 @@ async def count_spans(
     number of affected calls. Fast because it's just a COUNT query on
     indexed columns, no row data transferred.
 
+    Without campaign_id, agent_config_id or prompt_ref the window is at most one
+    day: count one day per call and add, or use event_counts_over_time for a
+    daily series.
+
     Args:
         node: Node prefix filter (e.g. "llm.", "tool.").
         level: Level filter — "error" to count failures.
@@ -2501,6 +2500,14 @@ async def count_spans(
         time_from: ISO8601 start time (alternative to time_range_minutes).
         time_to: ISO8601 end time.
     """
+    if not (campaign_id or agent_config_id or prompt_ref):
+        window = _window_minutes(0 if time_from else time_range_minutes, time_from, time_to)
+        if window is not None and window > _UNSCOPED_COUNT_WINDOW_CAP_MIN:
+            raise ValueError(
+                f"count_spans without campaign_id, agent_config_id or prompt_ref is bounded "
+                f"to {_UNSCOPED_COUNT_WINDOW_CAP_MIN} minutes (one day). Count one day per "
+                f"call and add the results, or use event_counts_over_time for a daily series."
+            )
     params: dict = {}
     if node:
         params["node"] = node
@@ -3088,8 +3095,9 @@ async def list_filter_values(ctx: Context) -> dict[str, Any]:
     Returns campaigns, prompt_refs, agents, agent_config_ids, llm_models,
     llm_providers, stt_providers, tts_providers, customers, voice_mission_ids.
 
-    A filter value absent from this list will return zero rows — which is
-    indistinguishable from "the thing you asked about did not happen".
+    A filter value absent from this list will return zero rows over the last 7
+    days — which is indistinguishable from "the thing you asked about did not
+    happen". Older retained data can still hold it.
 
     Feeds the filters on list_calls, search_spans, slowest_calls, latency_over_time
     and latency_breakdown.
