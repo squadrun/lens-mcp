@@ -4,8 +4,8 @@ _check_granularity only bounds the bucket count, never the second (node/event_na
 dimension, so an unfiltered call can fan out across every distinct value fleet-wide. Past
 _MAX_ROWS_UNFILTERED that series is swapped for per-dimension totals rather than returned.
 
-The backend matches `nodes` exactly; _get_series_for_nodes reads a name with no row of its
-own as a prefix, so a stage or a partial name does not come back as an empty series.
+The backend matches `nodes` exactly; _get_series_for_nodes widens a stage ("llm") to the nodes
+under it, so a stage does not come back as an empty series. A full name is never widened.
 
 Run: uv run python tests/test_over_time.py
 """
@@ -159,7 +159,11 @@ def test_client_rollups_are_sized_on_the_rows_actually_fetched():
 
 
 class NodeSeries:
-    """A backend that, like the real one, returns only the nodes named exactly."""
+    """A backend that, like the real one, returns only the nodes named exactly.
+
+    Rows belong to campaign 7; a request for another campaign, or for none, gets nothing, so a
+    widened request that dropped the caller's other filters would show as an empty series.
+    """
 
     def __init__(self, nodes, buckets=1):
         self.rows = [
@@ -177,8 +181,11 @@ class NodeSeries:
         self.requests = []
 
     async def get(self, ctx, path, params=None):
-        self.requests.append(dict(params or {}))
-        named = (params or {}).get("nodes")
+        params = dict(params or {})
+        self.requests.append(params)
+        if params.get("campaign_id") != "7":
+            return {"series": []}
+        named = params.get("nodes")
         wanted = None if named is None else named.split(",")
         return {"series": [r for r in self.rows if wanted is None or r["node"] in wanted]}
 
@@ -188,54 +195,65 @@ FLEET = ("llm.arc", "llm.warmup", "tts.cartesia", "tts.cartesiacache#5", "stt.so
 
 def _latency(fake, nodes, **kwargs):
     with patched(fake):
-        return run(server.latency_over_time(ctx(), nodes=nodes, **kwargs)).structuredContent
+        result = run(server.latency_over_time(ctx(), nodes=nodes, campaign_id="7", **kwargs))
+    return result.structuredContent
 
 
-def test_a_full_node_name_with_rows_costs_one_request_and_returns_only_that_node():
+def test_full_node_names_go_to_the_backend_as_typed_and_return_only_those_nodes():
     fake = NodeSeries(FLEET)
     out = _latency(fake, "tts.cartesia,llm.arc")
 
-    assert len(fake.requests) == 1
+    assert [r["nodes"] for r in fake.requests] == ["tts.cartesia,llm.arc"]
     assert {r["node"] for r in out["series"]} == {"tts.cartesia", "llm.arc"}
-    assert "nodes_matched_by_prefix" not in out and "no_rows_for" not in out
+    assert "no_rows_under" not in out
 
 
-def test_a_stage_is_matched_as_a_prefix_and_the_response_names_what_it_matched():
+def test_an_idle_full_name_is_not_widened_to_a_neighbour_that_starts_with_it():
+    fake = NodeSeries(("tts.cartesiacache#5", "llm.arc.prewarm"))
+    out = _latency(fake, "tts.cartesia,llm.arc")
+
+    assert len(fake.requests) == 1
+    assert out["series"] == [] and "no_rows_under" not in out
+
+
+def test_a_stage_returns_the_nodes_under_it_from_one_request_that_keeps_the_other_filters():
     fake = NodeSeries(FLEET)
-    out = _latency(fake, "llm, tts.cartesia")
+    out = _latency(fake, "llm, tts.cartesia", time_range_minutes=90)
 
-    assert [r.get("nodes") for r in fake.requests] == ["llm,tts.cartesia", None]
+    (request,) = fake.requests
+    assert "nodes" not in request
+    assert request["campaign_id"] == "7" and request["granularity"] == "1hour"
+    assert request["time_range_minutes"] == 90
+    # tts.cartesia is a full name: tts.cartesiacache#5 is another node, and stays out.
     assert {r["node"] for r in out["series"]} == {"llm.arc", "llm.warmup", "tts.cartesia"}
-    assert out["nodes_matched_by_prefix"] == {"llm": ["llm.arc", "llm.warmup"]}
-    assert "no_rows_for" not in out
+    assert "no_rows_under" not in out
 
 
-def test_a_name_that_matches_nothing_lists_the_nodes_of_its_stage_that_have_rows():
-    out = _latency(NodeSeries(FLEET), "stt.deepgram,llm.arc")
+def test_a_stage_with_no_node_under_it_is_named_beside_the_stages_that_have_rows():
+    out = _latency(NodeSeries(FLEET), "asr,llm.")
 
-    assert {r["node"] for r in out["series"]} == {"llm.arc"}  # the name that did match stays
-    assert out["no_rows_for"] == ["stt.deepgram"]
-    assert out["nodes_with_rows"] == ["stt.soniox_eu"]
+    assert {r["node"] for r in out["series"]} == {"llm.arc", "llm.warmup"}
+    assert out["no_rows_under"] == ["asr"]
+    assert out["stages_with_rows"] == ["llm", "stt", "tts"]
 
 
-def test_a_prefix_widened_past_the_row_budget_becomes_totals_but_named_nodes_do_not():
+def test_a_stage_past_the_row_budget_becomes_totals_but_full_names_do_not():
     widened = _latency(NodeSeries(FLEET, buckets=700), "llm,tts", time_range_minutes=42000)
-    assert "a nodes prefix" in widened["TRUNCATED"] and "series" not in widened
+    assert "a stage in nodes" in widened["TRUNCATED"] and "series" not in widened
     assert {t["node"] for t in widened["totals"]} == set(FLEET) - {"stt.soniox_eu"}
-    assert widened["nodes_matched_by_prefix"]["llm"] == ["llm.arc", "llm.warmup"]
 
     named = _latency(NodeSeries(FLEET, buckets=700), ",".join(FLEET), time_range_minutes=42000)
     assert len(named["series"]) == 3500 and "TRUNCATED" not in named
 
 
-def test_error_counts_match_a_prefix_before_rolling_up():
+def test_error_counts_widen_a_stage_before_rolling_up():
     fake = NodeSeries(FLEET, buckets=3)
     with patched(fake):
         out = run(
-            server.error_counts_over_time(ctx(), nodes="llm.", granularity="1day")
+            server.error_counts_over_time(ctx(), nodes="llm.", campaign_id="7", granularity="1day")
         ).structuredContent
 
-    assert fake.requests[0]["granularity"] == "1hour"  # fetched at the source size
+    assert [r["granularity"] for r in fake.requests] == ["1hour"]  # fetched at the source size
     assert {(r["ts"], r["node"], r["errors"]) for r in out["series"]} == {
         ("2026-01-01", "llm.arc", 3),
         ("2026-01-01", "llm.warmup", 3),

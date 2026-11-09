@@ -410,8 +410,8 @@ use it to align calls when comparing them.
 ### node accepts a prefix
 `node=llm.`, `node=llm` and `node=llm.<provider>` all work with get_call_spans
 and count_spans. `nodes` on latency_over_time and error_counts_over_time takes full
-names; a name with no rows of its own is matched as a prefix there too, and the
-response says what it matched.
+names, or a stage (`llm`, `llm.`) for every node under it; a partial name (`llm.ar`)
+matches nothing there.
 
 ### Row caps — never percentile a single page
 get_call_spans returns a capped page of rows.
@@ -2621,7 +2621,7 @@ def _summarize_overflow(
     where refusing would waste the fetch and force a blind retry. range_keys are non-additive
     (percentiles), so they are reported as the [min, max] seen across buckets, never combined.
     Skipped when fan_out_filter is set — a caller who named values chose that multiplier —
-    unless a prefix widened it (_get_series_for_nodes), which the caller could not size.
+    unless a stage widened it (_get_series_for_nodes), which the caller could not size.
     """
     series = data.get("series")
     named = bool(fan_out_filter) and not widened
@@ -2639,7 +2639,7 @@ def _summarize_overflow(
                 lo, hi = t.get(f"{k}_range", (v, v))
                 t[f"{k}_range"] = (round(min(lo, v), 1), round(max(hi, v), 1))
     ranked = sorted(totals.values(), key=lambda t: t.get(sum_keys[0], 0), reverse=True)
-    cause = f"a {fan_out_param} prefix" if widened else f"no {fan_out_param} filter"
+    cause = f"a stage in {fan_out_param}" if widened else f"no {fan_out_param} filter"
     return {
         "TRUNCATED": (
             f"{len(series)} rows with {cause} is past the "
@@ -2725,47 +2725,39 @@ def _upper_bound_caveat(approx_key: str, granularity: str) -> str:
 async def _get_series_for_nodes(
     ctx: Context, path: str, params: dict, nodes: str
 ) -> tuple[dict, bool]:
-    """Fetch a per-node series, reading a name that has no row of its own as a prefix.
+    """Fetch a per-node series, widening a stage in `nodes` to every node under it.
 
-    The backend matches `nodes` exactly, so a bare stage ("llm") or a partial provider name
-    returns an empty series — indistinguishable from "nothing happened". When a name has no
-    row, the window is fetched once more without the filter and that name is matched as a
-    prefix, the way `node` works on the span tools. A full name that has rows costs one
-    request and returns only that node, as before.
+    The backend matches `nodes` exactly, so a stage ("llm", "tts.") returns an empty series —
+    indistinguishable from "nothing happened" — while `node` on the span tools takes the same
+    value as a prefix. When `nodes` holds a stage, the window is fetched without the filter
+    and narrowed here: a stage keeps the nodes under it, a full name keeps that node.
 
-    Returns the data and whether a prefix widened it. The data names what each prefix
-    matched (`nodes_matched_by_prefix`); a name that matches nothing either way is listed in
-    `no_rows_for`, beside the `nodes_with_rows` it could have meant.
+    Full names alone go to the backend as before. A full name is never widened: an idle node
+    legitimately has no rows, and its neighbours (tts.cartesia, tts.cartesiacache#5) are other
+    nodes.
+
+    Returns the data and whether a stage widened it, which the caller could not size. A stage
+    with no node under it is listed in `no_rows_under`, beside `stages_with_rows`.
     """
     names = [name.strip() for name in nodes.split(",") if name.strip()]
-    if names:
-        # Exact matching makes "a, b" a miss for " b"; send the names as compared below.
-        params = {**params, "nodes": ",".join(names)}
-    data = await _get(ctx, path, params=params)
-    series = data.get("series")
-    if not names or not isinstance(series, list):
-        return data, False
-    have_rows = {row.get("node") for row in series}
-    missing = [name for name in names if name not in have_rows]
-    if not missing:
-        return data, False
+    stages = tuple(
+        name.rstrip(".") + "." for name in names if name.endswith(".") or "." not in name
+    )
+    if not stages:
+        return await _get(ctx, path, params=params), False
     unfiltered = {key: value for key, value in params.items() if key != "nodes"}
-    window = await _get(ctx, path, params=unfiltered)
-    rows = window.get("series")
-    if not isinstance(rows, list):
-        return data, False
-    in_window = sorted({row["node"] for row in rows if isinstance(row.get("node"), str)})
-    by_prefix = {name: [node for node in in_window if node.startswith(name)] for name in missing}
-    keep = have_rows.union(*by_prefix.values())
-    out = {**window, "series": [row for row in rows if row.get("node") in keep]}
-    if matched := {name: found for name, found in by_prefix.items() if found}:
-        out["nodes_matched_by_prefix"] = matched
-    if unmatched := [name for name in missing if not by_prefix[name]]:
-        stages = {name.split(".")[0] for name in unmatched}
-        same_stage = [node for node in in_window if node.split(".")[0] in stages]
-        out["no_rows_for"] = unmatched
-        out["nodes_with_rows"] = same_stage or in_window
-    return out, bool(matched)
+    data = await _get(ctx, path, params=unfiltered)
+    series = data.get("series")
+    if not isinstance(series, list):
+        return data, True
+    in_window = {row["node"] for row in series if isinstance(row.get("node"), str)}
+    under = {stage: {node for node in in_window if node.startswith(stage)} for stage in stages}
+    kept = in_window.intersection(names).union(*under.values())
+    out = {**data, "series": [row for row in series if row.get("node") in kept]}
+    if empty := [stage[:-1] for stage, nodes_under in under.items() if not nodes_under]:
+        out["no_rows_under"] = empty
+        out["stages_with_rows"] = sorted({node.split(".")[0] for node in in_window})
+    return out, True
 
 
 _RETENTION = {
@@ -2808,7 +2800,7 @@ async def latency_over_time(
 
     Args:
         granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "10min" / "30min" / "1day": the backend has only these three, and percentiles can't be summed into coarser buckets — event_counts_over_time / error_counts_over_time offer them, since counts can.
-        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). A full name returns that node. A name with no rows of its own — a stage ("llm", "tts.") or a partial provider name — is matched as a prefix, and nodes_matched_by_prefix lists what it matched; a name that matches nothing is in no_rows_for, beside the nodes_with_rows it could have meant. Empty returns every node, summarized to totals past the row budget above.
+        nodes: Comma-separated nodes to restrict to. A full name ("llm.<provider>") is that node alone, matched exactly. A stage ("llm" or "tts.") is every node under it, held to the row budget above; a stage with no node under it is listed in no_rows_under, beside stages_with_rows. Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config.
         prompt_ref: Restrict to a prompt reference ID.
@@ -2972,7 +2964,7 @@ async def error_counts_over_time(
 
     Args:
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
-        nodes: Comma-separated node names to restrict to, matched as on latency_over_time: a full name, or a stage or partial name as a prefix (see nodes_matched_by_prefix). Only nodes with errors have rows here, so no_rows_for means no errors in the window, not a wrong name. Empty returns all, summarized to totals past the row budget above.
+        nodes: Comma-separated nodes to restrict to, as on latency_over_time: a full name matched exactly, or a stage ("llm") for every node under it. Only nodes with errors have rows. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
