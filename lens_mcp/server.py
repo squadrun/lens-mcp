@@ -257,7 +257,6 @@ Pick the tool by the question:
 (trends), `tool_outcomes` (each tool's success rate and duration), \
 `count_spans` (a count), `slowest_calls` (a ranking).
 - Find calls: `list_calls`; put two side by side with `compare_calls`.
-- Find spans by node or event across calls: `search_spans`.
 - Explain one call: `get_call_spans` (its waterfall), `aggregate_spans` \
 (statistics over it), `get_call_config`, `get_call_transcript`, \
 `get_call_trace_logs`.
@@ -402,39 +401,18 @@ _CLIENT_NOTES = f"""
 
 ## Client notes (lens-mcp {_VERSION}) — read before computing any number
 
-Installs are per-machine `git pull`s, so this version is the only reliable
-statement of which tools you have. If a tool named below is missing from your
-session, the install is stale — re-run the install command in the lens-mcp README.
-
 ### turn_number is a BOT-UTTERANCE counter, not a user-turn counter
 It counts bot utterances — incremented each time the bot stops speaking, so
 fillers, idle nudges and any non-LLM TTS advance it.
 Two calls at the same turn_number are NOT at equal conversational depth — do not
 use it to align calls when comparing them.
 
-### metadata_filter needs a node scope
-metadata is unindexed, so filtering it across a whole time window would scan every
-span; the server requires a narrowing filter alongside it and search_spans checks
-for one before making the request. Before lens#55 the unscoped form returned 0 hits
-instead of an error, which is why older notes claim it "fails for transport".
-Values match exactly and case-sensitively against the raw JSON value —
-the full model id hits; a prefix of it, or a different case, does not. Numbers and bools
-match as written in the JSON (`prompt_tokens:26430`, `speech_final:true`).
-
-### event_name / phase on /search need lens#55
-Before that fix the backend accepted both and filtered on neither, returning
-unfiltered rows with a 200. search_spans now checks the rows it gets back and
-prefixes the response with FILTER_IGNORED if the backend is still dropping them —
-if you see that, the filter did not apply and the rows are not what you asked for.
-count_spans has always honoured both.
-
 ### node accepts a prefix
-`node=llm.`, `node=llm` and `node=llm.<provider>` all work, on both search_spans and
-get_call_spans. Verified as genuinely filtering, along with level, campaign_id
-and value_ms_min/max.
+`node=llm.`, `node=llm` and `node=llm.<provider>` all work with get_call_spans
+and count_spans.
 
 ### Row caps — never percentile a single page
-get_call_spans returns at most 500 rows per request, search_spans at most 100.
+get_call_spans returns a capped page of rows.
 A p90 computed from one truncated page is wrong with no warning. Use
 aggregate_spans (single call) or aggregate_calls (cohort): both page to
 exhaustion and report `complete: false` if they could not.
@@ -447,7 +425,7 @@ person waited for the bot to start answering — is pipeline.bot_reaction_time.
 ### Bulk analysis: export, don't read
 For more than a couple of calls, do not read spans into context. `export_spans` and
 `export_turn_latency` page every call to a local 0600 file and return only its path; analyse
-it with Bash. To read a little: `get_call_spans` / `search_spans` / `list_calls` take
+it with Bash. To read a little: `get_call_spans` / `list_calls` take
 `fields="a,b,metadata.k"` and `get_call_spans` takes `event_name` (cheapest single-event read).
 
 ### Retention differs per table
@@ -480,11 +458,11 @@ async def get_schema(ctx: Context) -> str:
     - The difference between call_spans (structured, fast) vs call_trace_logs (raw text, slow)
     - The correct query strategy to avoid expensive operations
     - Semantics that silently produce wrong numbers if you assume them
-      (turn_number, metadata_filter scoping, row caps, retention)
+      (turn_number, row caps, retention)
 
     Key rules:
-    - Use search_spans with structured filters (node, event_name, level, campaign_id) — these are indexed
-    - NEVER broad-search trace logs — only drill into specific call_sids
+    - Use list_calls to find calls and get_call_spans to read their structured spans
+    - Use search_trace_logs for log-text discovery within its supported time window
     - Time bounds are mandatory for any search
     - Never compute a percentile from raw span rows — use aggregate_spans/aggregate_calls
     """
@@ -1751,7 +1729,7 @@ async def export_spans(
 ) -> dict[str, Any]:
     """Export spans from many calls to ONE local file; returns the path, never the rows.
 
-    Use this instead of get_call_spans / search_spans whenever you want to analyse spans
+    Use this instead of get_call_spans whenever you want to analyse spans
     across more than a couple of calls: the rows go to disk, so none of them cost context
     tokens. Then work on the file with Bash (python, duckdb, awk). Each call is read whole,
     so the file is complete unless the call appears in calls_truncated. Rows are grouped by
@@ -2166,7 +2144,7 @@ def _filters_dropped_by_server(data: dict, **filters: str) -> list[str]:
     ]
 
 
-@mcp.tool(annotations=READ_ONLY)
+# The external /search endpoint is disabled, so this client helper is not an MCP tool.
 async def search_spans(
     ctx: Context,
     query: str = "",
@@ -2760,8 +2738,7 @@ async def latency_over_time(
 ) -> dict[str, Any]:
     """Latency percentiles per node per time bucket — the fleet trend in one call.
 
-    USE THIS INSTEAD OF sweeping search_spans across time windows. Returns
-    p50/p90/p95/p99 + count for every node in every bucket, computed server-side
+    Returns p50/p90/p95/p99 + count for every node in every bucket, computed server-side
     from a materialized view, so a week-long window costs the same as an hour.
 
     Answers:
@@ -2826,8 +2803,7 @@ async def latency_breakdown(
 ) -> dict[str, Any]:
     """Percentiles per node and phase across the whole fleet — the stage attribution table.
 
-    One call replaces walking search_spans through llm. / stt. / tts. /
-    pipeline.* one prefix at a time. Returns count + p25/p50/p80/p90/p95/p99 per
+    Returns count + p25/p50/p80/p90/p95/p99 per
     (node, phase) over every matching span — hundreds of thousands of spans, not
     a 100-row sample.
 
@@ -3110,7 +3086,7 @@ async def list_filter_values(ctx: Context) -> dict[str, Any]:
     days — which is indistinguishable from "the thing you asked about did not
     happen". Older retained data can still hold it.
 
-    Feeds the filters on list_calls, search_spans, slowest_calls, latency_over_time
+    Feeds the filters on list_calls, slowest_calls, latency_over_time
     and latency_breakdown.
     """
     return _out(await _get(ctx, "/observability/filters"))
@@ -3133,11 +3109,8 @@ async def search_trace_logs(
     This is the fleet-wide log grep. Use it to find which calls contain a log
     line, then drill in with download_trace_logs.
 
-    Not to be confused with search_spans, which matches span columns and cannot see
-    log text at all. If you are looking for a phrase a service logged, it is this
-    tool. Previously this meant calling
-    get_call_trace_logs once per call_sid, which needs the call list up front —
-    exactly what you do not have when hunting an unknown failure.
+    Searches log message bodies. Use get_call_spans to inspect structured spans
+    for a known call.
 
     Examples:
         search_trace_logs("rate limit exceeded")
