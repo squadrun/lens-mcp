@@ -409,7 +409,9 @@ use it to align calls when comparing them.
 
 ### node accepts a prefix
 `node=llm.`, `node=llm` and `node=llm.<provider>` all work with get_call_spans
-and count_spans.
+and count_spans. `nodes` on latency_over_time and error_counts_over_time takes full
+names; a name with no rows of its own is matched as a prefix there too, and the
+response says what it matched.
 
 ### Row caps — never percentile a single page
 get_call_spans returns a capped page of rows.
@@ -2611,16 +2613,19 @@ def _summarize_overflow(
     sum_keys: tuple[str, ...],
     range_keys: tuple[str, ...] = (),
     caveat: str = "",
+    widened: bool = False,
 ) -> dict:
     """Swap an oversized unfiltered series for one total per dim_key over the whole window.
 
     The rows are already fetched, so a digest answers "which ones matter" at no extra cost,
     where refusing would waste the fetch and force a blind retry. range_keys are non-additive
     (percentiles), so they are reported as the [min, max] seen across buckets, never combined.
-    Skipped when fan_out_filter is set — a caller who named values chose that multiplier.
+    Skipped when fan_out_filter is set — a caller who named values chose that multiplier —
+    unless a prefix widened it (_get_series_for_nodes), which the caller could not size.
     """
     series = data.get("series")
-    if fan_out_filter or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
+    named = bool(fan_out_filter) and not widened
+    if named or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
         return data
     totals: dict = {}
     for row in series:
@@ -2634,9 +2639,10 @@ def _summarize_overflow(
                 lo, hi = t.get(f"{k}_range", (v, v))
                 t[f"{k}_range"] = (round(min(lo, v), 1), round(max(hi, v), 1))
     ranked = sorted(totals.values(), key=lambda t: t.get(sum_keys[0], 0), reverse=True)
+    cause = f"a {fan_out_param} prefix" if widened else f"no {fan_out_param} filter"
     return {
         "TRUNCATED": (
-            f"{len(series)} rows with no {fan_out_param} filter is past the "
+            f"{len(series)} rows with {cause} is past the "
             f"{_MAX_ROWS_UNFILTERED}-row budget, so the per-bucket series was replaced by one "
             f"total per {dim_key} over the whole window, largest first.{caveat} For the time "
             f"series, re-run with {fan_out_param}=<the {dim_key}s you care about>, narrow the "
@@ -2716,6 +2722,52 @@ def _upper_bound_caveat(approx_key: str, granularity: str) -> str:
     )
 
 
+async def _get_series_for_nodes(
+    ctx: Context, path: str, params: dict, nodes: str
+) -> tuple[dict, bool]:
+    """Fetch a per-node series, reading a name that has no row of its own as a prefix.
+
+    The backend matches `nodes` exactly, so a bare stage ("llm") or a partial provider name
+    returns an empty series — indistinguishable from "nothing happened". When a name has no
+    row, the window is fetched once more without the filter and that name is matched as a
+    prefix, the way `node` works on the span tools. A full name that has rows costs one
+    request and returns only that node, as before.
+
+    Returns the data and whether a prefix widened it. The data names what each prefix
+    matched (`nodes_matched_by_prefix`); a name that matches nothing either way is listed in
+    `no_rows_for`, beside the `nodes_with_rows` it could have meant.
+    """
+    names = [name.strip() for name in nodes.split(",") if name.strip()]
+    if names:
+        # Exact matching makes "a, b" a miss for " b"; send the names as compared below.
+        params = {**params, "nodes": ",".join(names)}
+    data = await _get(ctx, path, params=params)
+    series = data.get("series")
+    if not names or not isinstance(series, list):
+        return data, False
+    have_rows = {row.get("node") for row in series}
+    missing = [name for name in names if name not in have_rows]
+    if not missing:
+        return data, False
+    unfiltered = {key: value for key, value in params.items() if key != "nodes"}
+    window = await _get(ctx, path, params=unfiltered)
+    rows = window.get("series")
+    if not isinstance(rows, list):
+        return data, False
+    in_window = sorted({row["node"] for row in rows if isinstance(row.get("node"), str)})
+    by_prefix = {name: [node for node in in_window if node.startswith(name)] for name in missing}
+    keep = have_rows.union(*by_prefix.values())
+    out = {**window, "series": [row for row in rows if row.get("node") in keep]}
+    if matched := {name: found for name, found in by_prefix.items() if found}:
+        out["nodes_matched_by_prefix"] = matched
+    if unmatched := [name for name in missing if not by_prefix[name]]:
+        stages = {name.split(".")[0] for name in unmatched}
+        same_stage = [node for node in in_window if node.split(".")[0] in stages]
+        out["no_rows_for"] = unmatched
+        out["nodes_with_rows"] = same_stage or in_window
+    return out, bool(matched)
+
+
 _RETENTION = {
     "mv": "aggregates retain 90 days — longer than the 30-day raw spans they summarise",
     "spans": "raw spans retain 30 days",
@@ -2756,7 +2808,7 @@ async def latency_over_time(
 
     Args:
         granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "10min" / "30min" / "1day": the backend has only these three, and percentiles can't be summed into coarser buckets — event_counts_over_time / error_counts_over_time offer them, since counts can.
-        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, summarized to totals past the row budget above.
+        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). A full name returns that node. A name with no rows of its own — a stage ("llm", "tts.") or a partial provider name — is matched as a prefix, and nodes_matched_by_prefix lists what it matched; a name that matches nothing is in no_rows_for, beside the nodes_with_rows it could have meant. Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config.
         prompt_ref: Restrict to a prompt reference ID.
@@ -2776,7 +2828,7 @@ async def latency_over_time(
     if prompt_ref:
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
-    data = await _get(ctx, "/observability/timeseries", params=params)
+    data, widened = await _get_series_for_nodes(ctx, "/observability/timeseries", params, nodes)
     if not full_series:
         data = _summarize_overflow(
             data,
@@ -2787,6 +2839,7 @@ async def latency_over_time(
             ("p50_ms", "p90_ms", "p95_ms", "p99_ms"),
             caveat=" Percentiles can't be combined across buckets, so each p*_ms_range is the "
             "[min, max] seen across them.",
+            widened=widened,
         )
     return _out({"retention": _RETENTION["mv"], **data})
 
@@ -2919,7 +2972,7 @@ async def error_counts_over_time(
 
     Args:
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
-        nodes: Comma-separated node names to restrict to. Empty returns all, summarized to totals past the row budget above.
+        nodes: Comma-separated node names to restrict to, matched as on latency_over_time: a full name, or a stage or partial name as a prefix (see nodes_matched_by_prefix). Only nodes with errors have rows here, so no_rows_for means no errors in the window, not a wrong name. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
@@ -2936,7 +2989,9 @@ async def error_counts_over_time(
     if prompt_ref:
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
-    data = await _get(ctx, "/observability/error-timeseries", params=params)
+    data, widened = await _get_series_for_nodes(
+        ctx, "/observability/error-timeseries", params, nodes
+    )
     data = _apply_rollup(data, granularity, "node", "errors", "affected_calls")
     if not full_series:
         data = _summarize_overflow(
@@ -2946,6 +3001,7 @@ async def error_counts_over_time(
             "node",
             ("errors", "affected_calls"),
             caveat=_upper_bound_caveat("affected_calls", granularity),
+            widened=widened,
         )
     return _out({"retention": _RETENTION["mv"], **data})
 
