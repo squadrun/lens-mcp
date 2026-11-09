@@ -317,9 +317,8 @@ async def _ensure_auth(ctx: Context) -> None:
     lc["authenticated"] = True
 
 
-# 429 (per-principal rate limit) and 503 (heavy-query concurrency shed) are load-shedding, not
-# broken queries — the server asks you to back off, so retry rather than surface an error. 502/504
-# are gateway blips. All are transient.
+# Rate limits, capacity sheds and gateway blips can recover. A 503 that explicitly
+# disables an endpoint is permanent and must be surfaced before this retry policy.
 _RETRY_STATUS = {429, 502, 503, 504}
 _LOAD_SHED_STATUS = {429, 503}
 _MAX_RETRIES = 2
@@ -359,6 +358,15 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
             _clear_cached_token()
             _set_auth(client, await _authenticate(client))
             resp = await client.get(url, params=params)
+
+        if resp.status_code == 503:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            detail = body.get("detail") if isinstance(body, dict) else None
+            if isinstance(detail, str) and detail.startswith("Disabled — "):
+                raise RuntimeError(f"GET {path} failed (HTTP 503): {detail}")
 
         if resp.status_code in _RETRY_STATUS:
             if attempt < _MAX_RETRIES:
