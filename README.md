@@ -13,7 +13,7 @@ campaigns / models / providers you can actually filter on — check before guess
 
 **Fleet: what is happening across calls.** `latency_over_time` · `latency_breakdown` ·
 `event_counts_over_time` · `error_counts_over_time` · `tool_outcomes` · `slowest_calls` ·
-`get_extraction_stats` · `list_calls` · `search_spans` · `count_spans`
+`get_extraction_stats` · `list_calls` · `count_spans`
 
 **One call: what happened in it.** `get_call_details` · `get_call_spans` · `aggregate_spans` ·
 `get_call_transcript` · `get_call_entities` · `get_call_context` · `get_lead_details` ·
@@ -49,7 +49,7 @@ uv --directory ~/.cache/lens-mcp/repo run lens-mcp export-spans sid1,sid2 --even
 uv --directory ~/.cache/lens-mcp/repo run lens-mcp export-turns @/tmp/sids.txt --max-turn 10
 ```
 
-To read a little rather than export: `get_call_spans`, `search_spans` and `list_calls` take
+To read a little rather than export: `get_call_spans` and `list_calls` take
 `fields="a,b,metadata.key"`; `get_call_spans` takes `event_name`; `list_calls` takes `min_turns`,
 `min_duration_ms` and `max_scan` (filtered by the backend where it supports it, else client-side; reports `server_filtered`, `scanned` / `scan_complete`).
 
@@ -58,8 +58,8 @@ Tool results are compact JSON, not indented.
 
 Two rules the tools enforce rather than merely document:
 
-- **Never compute a percentile from rows.** `get_call_spans` caps at 500 per page and
-  `search_spans` at 100, so a statistic from one response is wrong on anything busy. Use
+- **Never compute a percentile from rows.** `get_call_spans` returns a capped page,
+  so a statistic from one response is wrong on anything busy. Use
   `aggregate_spans` (one call), `slowest_calls` (a cohort) or `latency_breakdown` (the fleet).
   Row responses carry a loud `TRUNCATED` notice when they are a partial view.
 - **Retention differs by source, and responses say which.** Aggregate views 90 days ·
@@ -106,10 +106,7 @@ Then register it (`~/.claude.json`, per project or globally):
 `get_schema` reports the running version in its client-notes header, so any session
 can tell you. Compare it against `version` in `pyproject.toml` on `main`.
 
-This matters more than it sounds. Skills and docs that reference a tool by name fail
-opaquely when the install predates it — the tool is simply absent from the session,
-with no error explaining why. If a documented tool is missing, update before
-debugging anything else.
+The client's tool list and the host's grants determine what a session can call.
 
 **Bump `version` in `pyproject.toml` in any PR that adds or changes a tool.** It is
 the only signal a user has.
@@ -125,16 +122,14 @@ the only signal a user has.
 
 ## Backend coupling
 
-Some tools depend on fixes in [`squadrun/lens`](https://github.com/squadrun/lens)
-and degrade visibly, not silently, when the backend is older:
+The client follows the external API in [`squadrun/lens`](https://github.com/squadrun/lens):
 
-- A backend can disable `/search` with a `503` whose detail starts with `Disabled — `.
+- `/search` is disabled, so `search_spans` is not registered as an MCP tool.
+  Its client helper remains available to direct Python callers using older backends.
+- A backend can disable an endpoint with a `503` whose detail starts with `Disabled — `.
   The client returns that explanation and its remedy without retrying. Use `list_calls`
   followed by `get_call_spans` for a bounded set of calls when span search is disabled.
   Other capacity and rate-limit responses retain their retries.
-- `search_spans(event_name=…, phase=…)` needs lens#55. Without it the backend drops
-  both filters and returns a `200` of unfiltered rows; `search_spans` inspects the
-  result and prefixes `FILTER_IGNORED` when it can prove that happened.
 
 **Deploy the backend before the client** when a change spans both.
 

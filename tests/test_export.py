@@ -83,7 +83,7 @@ def test_fields_keeps_truncated_notice():
     assert out["spans"][0] == {"turn_number": 0}
 
 
-def test_search_spans_fields_projects_matches_and_keeps_call_envelope():
+def test_legacy_search_helper_projects_matches_and_keeps_call_envelope():
     payload = {"calls": [{"call_id": "c1", "matches": usage_spans(2)}], "total": 1}
 
     class One(FakeLens):
@@ -91,7 +91,7 @@ def test_search_spans_fields_projects_matches_and_keeps_call_envelope():
             return payload
 
     with patched(One()):
-        out = tool("search_spans", fields="event_name,metadata.model")
+        out = run(server.search_spans(ctx(), fields="event_name,metadata.model")).structuredContent
     assert out["calls"][0]["call_id"] == "c1"
     assert out["calls"][0]["matches"][0] == {"event_name": "llm.usage", "metadata.model": "m"}
 
