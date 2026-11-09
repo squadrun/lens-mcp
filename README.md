@@ -128,6 +128,10 @@ the only signal a user has.
 Some tools depend on fixes in [`squadrun/lens`](https://github.com/squadrun/lens)
 and degrade visibly, not silently, when the backend is older:
 
+- A backend can disable `/search` with a `503` whose detail starts with `Disabled — `.
+  The client returns that explanation and its remedy without retrying. Use `list_calls`
+  followed by `get_call_spans` for a bounded set of calls when span search is disabled.
+  Other capacity and rate-limit responses retain their retries.
 - `search_spans(event_name=…, phase=…)` needs lens#55. Without it the backend drops
   both filters and returns a `200` of unfiltered rows; `search_spans` inspects the
   result and prefixes `FILTER_IGNORED` when it can prove that happened.
