@@ -409,7 +409,9 @@ use it to align calls when comparing them.
 
 ### node accepts a prefix
 `node=llm.`, `node=llm` and `node=llm.<provider>` all work with get_call_spans
-and count_spans.
+and count_spans. `nodes` on latency_over_time and error_counts_over_time takes full
+names, or a stage (`llm`, `llm.`) for every node under it; a partial name (`llm.ar`)
+matches nothing there.
 
 ### Row caps — never percentile a single page
 get_call_spans returns a capped page of rows.
@@ -2611,16 +2613,19 @@ def _summarize_overflow(
     sum_keys: tuple[str, ...],
     range_keys: tuple[str, ...] = (),
     caveat: str = "",
+    widened: bool = False,
 ) -> dict:
     """Swap an oversized unfiltered series for one total per dim_key over the whole window.
 
     The rows are already fetched, so a digest answers "which ones matter" at no extra cost,
     where refusing would waste the fetch and force a blind retry. range_keys are non-additive
     (percentiles), so they are reported as the [min, max] seen across buckets, never combined.
-    Skipped when fan_out_filter is set — a caller who named values chose that multiplier.
+    Skipped when fan_out_filter is set — a caller who named values chose that multiplier —
+    unless a stage widened it (_get_series_for_nodes), which the caller could not size.
     """
     series = data.get("series")
-    if fan_out_filter or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
+    named = bool(fan_out_filter) and not widened
+    if named or not isinstance(series, list) or len(series) <= _MAX_ROWS_UNFILTERED:
         return data
     totals: dict = {}
     for row in series:
@@ -2634,9 +2639,10 @@ def _summarize_overflow(
                 lo, hi = t.get(f"{k}_range", (v, v))
                 t[f"{k}_range"] = (round(min(lo, v), 1), round(max(hi, v), 1))
     ranked = sorted(totals.values(), key=lambda t: t.get(sum_keys[0], 0), reverse=True)
+    cause = f"a stage in {fan_out_param}" if widened else f"no {fan_out_param} filter"
     return {
         "TRUNCATED": (
-            f"{len(series)} rows with no {fan_out_param} filter is past the "
+            f"{len(series)} rows with {cause} is past the "
             f"{_MAX_ROWS_UNFILTERED}-row budget, so the per-bucket series was replaced by one "
             f"total per {dim_key} over the whole window, largest first.{caveat} For the time "
             f"series, re-run with {fan_out_param}=<the {dim_key}s you care about>, narrow the "
@@ -2716,6 +2722,44 @@ def _upper_bound_caveat(approx_key: str, granularity: str) -> str:
     )
 
 
+async def _get_series_for_nodes(
+    ctx: Context, path: str, params: dict, nodes: str
+) -> tuple[dict, bool]:
+    """Fetch a per-node series, widening a stage in `nodes` to every node under it.
+
+    The backend matches `nodes` exactly, so a stage ("llm", "tts.") returns an empty series —
+    indistinguishable from "nothing happened" — while `node` on the span tools takes the same
+    value as a prefix. When `nodes` holds a stage, the window is fetched without the filter
+    and narrowed here: a stage keeps the nodes under it, a full name keeps that node.
+
+    Full names alone go to the backend as before. A full name is never widened: an idle node
+    legitimately has no rows, and its neighbours (tts.cartesia, tts.cartesiacache#5) are other
+    nodes.
+
+    Returns the data and whether a stage widened it, which the caller could not size. A stage
+    with no node under it is listed in `no_rows_under`, beside `stages_with_rows`.
+    """
+    names = [name.strip() for name in nodes.split(",") if name.strip()]
+    stages = tuple(
+        name.rstrip(".") + "." for name in names if name.endswith(".") or "." not in name
+    )
+    if not stages:
+        return await _get(ctx, path, params=params), False
+    unfiltered = {key: value for key, value in params.items() if key != "nodes"}
+    data = await _get(ctx, path, params=unfiltered)
+    series = data.get("series")
+    if not isinstance(series, list):
+        return data, True
+    in_window = {row["node"] for row in series if isinstance(row.get("node"), str)}
+    under = {stage: {node for node in in_window if node.startswith(stage)} for stage in stages}
+    kept = in_window.intersection(names).union(*under.values())
+    out = {**data, "series": [row for row in series if row.get("node") in kept]}
+    if empty := [stage[:-1] for stage, nodes_under in under.items() if not nodes_under]:
+        out["no_rows_under"] = empty
+        out["stages_with_rows"] = sorted({node.split(".")[0] for node in in_window})
+    return out, True
+
+
 _RETENTION = {
     "mv": "aggregates retain 90 days — longer than the 30-day raw spans they summarise",
     "spans": "raw spans retain 30 days",
@@ -2756,7 +2800,7 @@ async def latency_over_time(
 
     Args:
         granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "10min" / "30min" / "1day": the backend has only these three, and percentiles can't be summed into coarser buckets — event_counts_over_time / error_counts_over_time offer them, since counts can.
-        nodes: Comma-separated node names to restrict to (e.g. "llm.<provider>,tts.<provider>"). Empty returns every node, summarized to totals past the row budget above.
+        nodes: Comma-separated nodes to restrict to. A full name ("llm.<provider>") is that node alone, matched exactly. A stage ("llm" or "tts.") is every node under it, held to the row budget above; a stage with no node under it is listed in no_rows_under, beside stages_with_rows. Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config.
         prompt_ref: Restrict to a prompt reference ID.
@@ -2776,7 +2820,7 @@ async def latency_over_time(
     if prompt_ref:
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
-    data = await _get(ctx, "/observability/timeseries", params=params)
+    data, widened = await _get_series_for_nodes(ctx, "/observability/timeseries", params, nodes)
     if not full_series:
         data = _summarize_overflow(
             data,
@@ -2787,6 +2831,7 @@ async def latency_over_time(
             ("p50_ms", "p90_ms", "p95_ms", "p99_ms"),
             caveat=" Percentiles can't be combined across buckets, so each p*_ms_range is the "
             "[min, max] seen across them.",
+            widened=widened,
         )
     return _out({"retention": _RETENTION["mv"], **data})
 
@@ -2919,7 +2964,7 @@ async def error_counts_over_time(
 
     Args:
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
-        nodes: Comma-separated node names to restrict to. Empty returns all, summarized to totals past the row budget above.
+        nodes: Comma-separated nodes to restrict to, as on latency_over_time: a full name matched exactly, or a stage ("llm") for every node under it. Only nodes with errors have rows. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
@@ -2936,7 +2981,9 @@ async def error_counts_over_time(
     if prompt_ref:
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
-    data = await _get(ctx, "/observability/error-timeseries", params=params)
+    data, widened = await _get_series_for_nodes(
+        ctx, "/observability/error-timeseries", params, nodes
+    )
     data = _apply_rollup(data, granularity, "node", "errors", "affected_calls")
     if not full_series:
         data = _summarize_overflow(
@@ -2946,6 +2993,7 @@ async def error_counts_over_time(
             "node",
             ("errors", "affected_calls"),
             caveat=_upper_bound_caveat("affected_calls", granularity),
+            widened=widened,
         )
     return _out({"retention": _RETENTION["mv"], **data})
 
