@@ -521,8 +521,9 @@ async def get_call_details(
     Note the config holds the prompt TEMPLATE — for the rendered prompt actually
     sent to the LLM, use get_call_prompt instead.
 
-    For deep investigation after this, ALWAYS use download_trace_logs to download
-    raw logs locally, then grep with Bash. Never use get_call_trace_logs.
+    For deep investigation after this, read the call's raw logs. Where your client
+    offers download_trace_logs and can read local files, use it: it writes the logs
+    to a local file to grep. Otherwise query them with get_call_trace_logs.
 
     Args:
         call_sid: The call SID (e.g. "abc123def456").
@@ -1217,8 +1218,9 @@ async def get_call_trace_logs(
        If yes, grep the local file instead — it's faster and free.
     2. Is there a *_traces.log file in your temp/scratchpad directory for this call?
        If yes, use that — all logs are already there.
-    3. Only use this tool if download_trace_logs failed or you need a very
-       targeted server-side query on a call you haven't downloaded yet.
+    3. Only use this tool if download_trace_logs is not offered to you or failed,
+       or you need a very targeted server-side query on a call you haven't
+       downloaded yet.
 
     Warning: individual log lines can be 36KB+ (config dumps at call start),
     so even limit=5 can return 200K+ chars. Always set search or logger_name.
@@ -3064,6 +3066,12 @@ async def slowest_calls(
     Takes the same metric= as aggregate_spans, so it also ranks calls by prompt
     size: metric="metadata:prompt_tokens", event_name="llm.usage", order_by="max".
 
+    WINDOW LIMIT: without campaign_id, agent_config_id or prompt_ref the window is
+    bounded to 2 hours, because ranking a whole cohort groups every span by call.
+    The default window is 6 hours, so an unscoped call must pass a window of at
+    most 120 minutes or it is refused. Pass one of those filters to rank over a
+    wider window.
+
     Args:
         node: Node prefix to measure (e.g. "llm", "pipeline.bot_reaction_time"). Required — an unfiltered percentile mixes unrelated operations.
         phase: Phase filter ("ttfb", "complete", "error").
@@ -3075,8 +3083,8 @@ async def slowest_calls(
         percentiles: Comma-separated percentiles (default "50,90").
         order_by: Rank by this — a percentile like "p90", or avg/max/min/sum/count.
         min_spans: Skip calls with fewer than this many matching spans — raise it to stop one-span calls topping the ranking.
-        time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
-        time_from: ISO8601 start (alternative to time_range_minutes).
+        time_range_minutes: Look back N minutes (default 360). Max 120 (2h) unless campaign_id, agent_config_id or prompt_ref is set, then up to 43200 (30 days).
+        time_from: ISO8601 start (alternative to time_range_minutes). Without one of those filters the from/to span must be <=2h.
         time_to: ISO8601 end.
         limit: Max calls returned (default 50, max 500).
     """
