@@ -380,7 +380,21 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
                     f"rate-limited. Wait a moment and retry, or narrow the query."
                 )
 
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if resp.status_code != 413:
+                raise
+            try:
+                body = resp.json()
+            except ValueError:
+                raise exc from None
+            detail = (body.get("detail") or body.get("error")) if isinstance(body, dict) else None
+            if not isinstance(detail, str) or not detail.strip():
+                raise
+            raise httpx.HTTPStatusError(
+                f"{exc}\nLens: {detail[:1000]}", request=exc.request, response=exc.response
+            ) from exc
         try:
             return resp.json()
         except ValueError as e:
@@ -3182,17 +3196,23 @@ async def search_trace_logs(
     WINDOW LIMIT: unscoped (no campaign_id) this is bounded to 2 hours, because a
     fleet-wide text scan of call_trace_logs times out past a few hours at current
     log volume. You can walk a wider period by paging time_from/time_to in <=2h
-    slices. To search a wide window in one shot, pass campaign_id: it narrows to
-    that campaign's calls on the primary key first, which is ~100x faster and lifts
-    the limit to the full 4-day retention.
+    slices. A campaign_id lifts this client window cap and narrows the call IDs,
+    but large campaigns can still exceed the backend's scan or memory limit.
+    On HTTP 413, use the server's remedy: shorten the window or use list_calls
+    followed by get_call_trace_logs for a bounded set of calls.
+
+    Campaign-filtered historical searches can miss calls because the backend's
+    call-ID lookup uses recent spans for explicit date windows. For historical
+    investigations, identify candidate calls with list_calls and inspect their
+    per-call logs. An empty campaign search does not prove there are no matches.
 
     Args:
         query: Text to find in log messages (required).
         time_range_minutes: Look back N minutes (default 60). Max 120 (2h) unless campaign_id is set, then up to 5760 (4 days).
-        time_from: ISO8601 start. Unscoped, the from/to span must be <=2h; with campaign_id, any window.
+        time_from: ISO8601 start. Unscoped, the from/to span must be <=2h. See the historical campaign-search limitation above.
         time_to: ISO8601 end.
         level: Level filter (mostly useless — trace logs are nearly all info).
-        campaign_id: Restrict to calls in a campaign. Strongly preferred — it makes the search fast and unlocks the full window.
+        campaign_id: Restrict to calls in a campaign and lift the client window cap. Backend resource limits still apply.
         limit: Max log lines (default 50, max 500).
         offset: Row offset — the response carries has_more; page with offset=offset+limit.
     """
@@ -3205,8 +3225,8 @@ async def search_trace_logs(
                 f"A fleet-wide trace search (no campaign_id) is bounded to "
                 f"{_UNSCOPED_WINDOW_CAP_MIN} minutes (~2h) — an unbounded text scan over "
                 f"call_trace_logs times out at current scale. Either page the period in "
-                f"<=2h time_from/time_to slices, or pass campaign_id to search a wider window "
-                f"in one shot (it narrows on the primary key first, ~100x faster)."
+                f"<=2h time_from/time_to slices, or pass campaign_id to narrow the call IDs. "
+                f"Campaign searches remain subject to backend resource limits."
             )
     params: dict = {"q": query, "limit": min(max(limit, 1), 500), "offset": max(offset, 0)}
     if level:

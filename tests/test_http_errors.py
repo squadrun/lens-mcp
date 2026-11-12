@@ -18,6 +18,37 @@ import lens_mcp.server as server
 
 
 class HttpErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_trace_scan_refusal_preserves_remedy_without_retrying(self):
+        detail = "Query exceeded a resource limit. Search a shorter time window."
+        for field in ("detail", "error"):
+            with self.subTest(field=field):
+                requests = []
+
+                def respond(request, requests=requests, field=field):
+                    requests.append(request)
+                    return httpx.Response(413, json={field: detail})
+
+                async with httpx.AsyncClient(
+                    base_url="http://localhost", transport=httpx.MockTransport(respond)
+                ) as client:
+                    ctx = SimpleNamespace(
+                        request_context=SimpleNamespace(
+                            lifespan_context={"client": client, "authenticated": True}
+                        )
+                    )
+                    with (
+                        patch.object(server.asyncio, "sleep", new_callable=AsyncMock) as sleep,
+                        self.assertRaises(httpx.HTTPStatusError) as error,
+                    ):
+                        await server.search_trace_logs(
+                            ctx, query="blank_turn", campaign_id="149", time_range_minutes=1440
+                        )
+
+                self.assertIn(detail, str(error.exception))
+                self.assertEqual(error.exception.response.status_code, 413)
+                self.assertEqual(len(requests), 1)
+                sleep.assert_not_awaited()
+
     async def test_disabled_search_preserves_the_remedy_without_retrying(self):
         detail = (
             "Disabled — broad span search causes ClickHouse overload. "
