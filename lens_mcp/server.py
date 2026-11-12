@@ -380,7 +380,21 @@ async def _get(ctx: Context, path: str, params: dict | None = None) -> dict:
                     f"rate-limited. Wait a moment and retry, or narrow the query."
                 )
 
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if resp.status_code != 413:
+                raise
+            try:
+                body = resp.json()
+            except ValueError:
+                raise exc from None
+            detail = (body.get("detail") or body.get("error")) if isinstance(body, dict) else None
+            if not isinstance(detail, str) or not detail.strip():
+                raise
+            raise httpx.HTTPStatusError(
+                f"{exc}\nLens: {detail[:1000]}", request=exc.request, response=exc.response
+            ) from exc
         try:
             return resp.json()
         except ValueError as e:
