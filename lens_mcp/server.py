@@ -2239,7 +2239,7 @@ async def search_spans(
         value_ms_max: Max duration in ms.
         campaign_id: Filter by campaign. Indexed LowCardinality column.
         agent_config_id: Filter by agent config (comma-separated for several).
-        prompt_ref: Filter by prompt reference ID.
+        prompt_ref: Filter by prompt reference ID (comma-separated for several).
         customer: Filter by customer/tenant name.
         customer_exclude: Exclude a specific customer.
         include_metadata: If true, also search inside metadata JSON (slower).
@@ -2355,7 +2355,7 @@ async def list_calls(
         stt_provider: Filter by STT provider.
         llm_model: Filter by LLM model.
         tts_provider: Filter by TTS provider.
-        prompt_reference_id: Filter by prompt reference.
+        prompt_reference_id: Filter by prompt reference (comma-separated for several).
         time_range_minutes: Look back N minutes (default 60, max 10080 = 7 days). For older calls, use start_time_from/to instead.
         start_time_from: ISO8601 start time (alternative to time_range_minutes). No cap — use for calls older than 7 days.
         start_time_to: ISO8601 end time.
@@ -2518,7 +2518,7 @@ async def count_spans(
         phase: Phase filter (e.g. "error", "timeout").
         campaign_id: Campaign filter.
         agent_config_id: Agent config filter (comma-separated for several).
-        prompt_ref: Prompt reference filter.
+        prompt_ref: Prompt reference filter (comma-separated for several).
         time_range_minutes: Look back N minutes (default 60).
         time_from: ISO8601 start time (alternative to time_range_minutes).
         time_to: ISO8601 end time.
@@ -2910,7 +2910,7 @@ async def latency_over_time(
         nodes: Comma-separated nodes to restrict to. A full name ("llm.<provider>") is that node alone, matched exactly. A stage ("llm" or "tts.") is every node under it, held to the row budget above; a stage with no node under it is listed in no_rows_under, beside stages_with_rows. Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config (comma-separated for several).
-        prompt_ref: Restrict to a prompt reference ID.
+        prompt_ref: Restrict to a prompt reference ID (comma-separated for several).
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
@@ -2977,7 +2977,7 @@ async def latency_breakdown(
     Args:
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config (comma-separated for several).
-        prompt_ref: Restrict to a prompt reference ID.
+        prompt_ref: Restrict to a prompt reference ID (comma-separated for several).
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
@@ -3100,7 +3100,7 @@ async def error_counts_over_time(
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for errors, an upper bound for affected_calls; see the response's NOTE.
         nodes: Comma-separated nodes to restrict to, as on latency_over_time: a full name matched exactly, or a stage ("llm") for every node under it. Only nodes with errors have rows. Empty returns all, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign.
-        prompt_ref: Restrict to a prompt reference ID.
+        prompt_ref: Restrict to a prompt reference ID (comma-separated for several).
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
@@ -3158,7 +3158,7 @@ async def tool_outcomes(
 
     Args:
         campaign_id: Restrict to a campaign.
-        prompt_ref: Restrict to a prompt reference ID.
+        prompt_ref: Restrict to a prompt reference ID (comma-separated for several).
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
@@ -3231,7 +3231,7 @@ async def slowest_calls(
         metric: "value_ms" (default) or "metadata:<key>" for a numeric metadata field.
         campaign_id: Restrict to a campaign (comma-separated for several).
         agent_config_id: Restrict to an agent config (comma-separated for several).
-        prompt_ref: Restrict to a prompt reference ID.
+        prompt_ref: Restrict to a prompt reference ID (comma-separated for several).
         percentiles: Comma-separated percentiles (default "50,90").
         order_by: Rank by this — a percentile like "p90", or avg/max/min/sum/count.
         min_spans: Skip calls with fewer than this many matching spans — raise it to stop one-span calls topping the ranking.
