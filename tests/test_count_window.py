@@ -17,7 +17,7 @@ sent = []
 
 async def fake_get(ctx, path, params=None):
     sent.append(params)
-    return {"total_spans": 0, "affected_calls": 0}
+    return {"total_spans": 1, "affected_calls": 1}  # non-empty: no unmatched-filter check
 
 
 server._get = fake_get
