@@ -1092,7 +1092,7 @@ async def aggregate_calls(
         metric: What to measure — "value_ms" (span duration, default) or "metadata:<key>" (e.g. "metadata:prompt_tokens").
         campaign_id: Restrict to a campaign.
         voice_mission_id: Restrict to a voice mission.
-        agent_config_id: Restrict to an agent config.
+        agent_config_id: Restrict to an agent config (comma-separated for several).
         customer: Restrict to a customer/tenant.
         llm_model: Restrict to an LLM model.
         status: Call status filter (e.g. "completed") — worth setting, since in-progress calls have partial spans.
@@ -1142,8 +1142,20 @@ async def aggregate_calls(
     listing = await _get(ctx, "/calls", params=params)
     calls = listing.get("calls", [])
     if not calls:
+        empty = {
+            "calls_matched": 0,
+            "note": "No calls matched the filters — widen the time window.",
+        }
         return _out(
-            {"calls_matched": 0, "note": "No calls matched the filters — widen the time window."}
+            await _note_unmatched(
+                ctx,
+                empty,
+                True,
+                {"campaign_id": campaign_id, "agent_config_id": agent_config_id},
+                min(time_range_minutes, 10080),
+                start_time_from,
+                start_time_to,
+            )
         )
 
     sem = asyncio.Semaphore(_COHORT_CONCURRENCY)
@@ -2226,7 +2238,7 @@ async def search_spans(
         value_ms_min: Min duration in ms (find slow operations).
         value_ms_max: Max duration in ms.
         campaign_id: Filter by campaign. Indexed LowCardinality column.
-        agent_config_id: Filter by agent config.
+        agent_config_id: Filter by agent config (comma-separated for several).
         prompt_ref: Filter by prompt reference ID.
         customer: Filter by customer/tenant name.
         customer_exclude: Exclude a specific customer.
@@ -2334,7 +2346,7 @@ async def list_calls(
     Args:
         campaign_id: Filter by campaign.
         voice_mission_id: Filter by voice mission (a campaign contains many).
-        agent_config_id: Filter by agent config ID.
+        agent_config_id: Filter by agent config ID (comma-separated for several).
         customer: Filter by customer/tenant.
         status: Filter by call status (e.g. "completed").
         ee_status: Filter by entity-extraction status (e.g. "success"). Use this
@@ -2397,11 +2409,17 @@ async def list_calls(
     if start_time_to:
         params["start_time_to"] = start_time_to
     wanted = _parse_fields(fields)
+    id_filters = {
+        "campaign_id": campaign_id,
+        "agent_config_id": agent_config_id,
+        "prompt_reference_id": prompt_reference_id,
+    }
+    window = (min(time_range_minutes, 10080), start_time_from, start_time_to)
     if min_turns <= 0 and min_duration_ms <= 0:
         data = await _get(ctx, "/calls", params=params)
         if wanted:
             data = {**data, "calls": _project_rows(data.get("calls", []), wanted)}
-        return _out(data)
+        return _out(await _note_unmatched(ctx, data, not data.get("calls"), id_filters, *window))
 
     cap = min(max(max_scan, 1), _MAX_CALLS_SCAN)
     keep = min(max(limit, 1), 100)
@@ -2456,18 +2474,17 @@ async def list_calls(
         if len(matched) >= keep:
             break
     shown = matched[:keep]
-    return _out(
-        {
-            "calls": _project_rows(shown, wanted) if wanted else shown,
-            "scanned": scanned,
-            "matched": len(matched),
-            "scan_complete": complete,
-            "next_offset": None if complete else pos,
-            "server_filtered": server_filtered,
-            "start_time_from_pinned": pinned_from or None,
-            "start_time_to_pinned": pinned_to or None,
-        }
-    )
+    data = {
+        "calls": _project_rows(shown, wanted) if wanted else shown,
+        "scanned": scanned,
+        "matched": len(matched),
+        "scan_complete": complete,
+        "next_offset": None if complete else pos,
+        "server_filtered": server_filtered,
+        "start_time_from_pinned": pinned_from or None,
+        "start_time_to_pinned": pinned_to or None,
+    }
+    return _out(await _note_unmatched(ctx, data, not matched, id_filters, *window))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2500,7 +2517,7 @@ async def count_spans(
         event_name: Exact event name filter (e.g. "pipeline.call_start").
         phase: Phase filter (e.g. "error", "timeout").
         campaign_id: Campaign filter.
-        agent_config_id: Agent config filter.
+        agent_config_id: Agent config filter (comma-separated for several).
         prompt_ref: Prompt reference filter.
         time_range_minutes: Look back N minutes (default 60).
         time_from: ISO8601 start time (alternative to time_range_minutes).
@@ -2536,7 +2553,23 @@ async def count_spans(
         params["time_range_minutes"] = time_range_minutes
     if time_to:
         params["time_to"] = time_to
-    return _out(await _get(ctx, "/search/count", params=params))
+    data = await _get(ctx, "/search/count", params=params)
+    id_filters = {
+        "campaign_id": campaign_id,
+        "agent_config_id": agent_config_id,
+        "prompt_ref": prompt_ref,
+    }
+    return _out(
+        await _note_unmatched(
+            ctx,
+            data,
+            data.get("total_spans") == 0,
+            id_filters,
+            time_range_minutes,
+            time_from,
+            time_to,
+        )
+    )
 
 
 # ── Fleet aggregation (server-side, one hop instead of a sweep) ────────
@@ -2551,6 +2584,64 @@ def _window(params: dict, time_range_minutes: int, time_from: str, time_to: str)
     if time_to:
         params["time_to"] = time_to
     return params
+
+
+_COUNT_RANGE_CAP_MIN = 10080  # /search/count's time_range_minutes ceiling; time_from has none
+# The filter name a tool takes -> the /search/count param that filters the same column.
+_COUNT_FILTER_PARAM = {"prompt_reference_id": "prompt_ref"}
+
+
+async def _note_unmatched(
+    ctx: Context,
+    data: dict,
+    empty: bool,
+    filters: dict[str, str],
+    time_range_minutes: int,
+    time_from: str = "",
+    time_to: str = "",
+) -> dict:
+    """On an empty result, add `unmatched_filters` naming each ID filter value with no spans
+    in the window on its own, e.g. 'agent_config_id "9999" matched no spans in this window'.
+
+    Runs only when the result is already empty, so a non-empty call costs no extra query.
+    An empty result is a success body, not an error, and a failed check adds no note: callers
+    that count error payloads toward a breaker must not see a strike for "no data".
+    """
+    values = [
+        (name, value.strip())
+        for name, raw in filters.items()
+        if raw
+        for value in raw.split(",")
+        if value.strip()
+    ]
+    if not empty or not values:
+        return data
+    window: dict = {}
+    if time_from:
+        window["time_from"] = time_from
+    elif time_range_minutes > _COUNT_RANGE_CAP_MIN:
+        start = datetime.now(UTC) - timedelta(minutes=time_range_minutes)
+        window["time_from"] = start.isoformat(timespec="seconds")
+    elif time_range_minutes > 0:
+        window["time_range_minutes"] = time_range_minutes
+    if time_to:
+        window["time_to"] = time_to
+
+    async def unmatched(name: str, value: str) -> bool:
+        params = {_COUNT_FILTER_PARAM.get(name, name): value, **window}
+        try:
+            counted = await _get(ctx, "/search/count", params=params)
+        except Exception:
+            return False
+        return counted.get("total_spans") == 0
+
+    found = await asyncio.gather(*(unmatched(name, value) for name, value in values))
+    notes = [
+        f'{name} "{value}" matched no spans in this window'
+        for (name, value), none in zip(values, found, strict=True)
+        if none
+    ]
+    return {**data, "unmatched_filters": notes} if notes else data
 
 
 async def _get_new_endpoint(ctx: Context, path: str, params: dict, needs: str) -> dict:
@@ -2818,7 +2909,7 @@ async def latency_over_time(
         granularity: Bucket size — "5min", "15min" or "1hour" (default). Coarser is smaller; prefer 1hour for windows over a day. No "10min" / "30min" / "1day": the backend has only these three, and percentiles can't be summed into coarser buckets — event_counts_over_time / error_counts_over_time offer them, since counts can.
         nodes: Comma-separated nodes to restrict to. A full name ("llm.<provider>") is that node alone, matched exactly. A stage ("llm" or "tts.") is every node under it, held to the row budget above; a stage with no node under it is listed in no_rows_under, beside stages_with_rows. Empty returns every node, summarized to totals past the row budget above.
         campaign_id: Restrict to a campaign (comma-separated for several).
-        agent_config_id: Restrict to an agent config.
+        agent_config_id: Restrict to an agent config (comma-separated for several).
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
@@ -2849,6 +2940,15 @@ async def latency_over_time(
             "[min, max] seen across them.",
             widened=widened,
         )
+    data = await _note_unmatched(
+        ctx,
+        data,
+        not data.get("series") and not data.get("totals"),
+        {"campaign_id": campaign_id, "agent_config_id": agent_config_id, "prompt_ref": prompt_ref},
+        time_range_minutes,
+        time_from,
+        time_to,
+    )
     return _out({"retention": _RETENTION["mv"], **data})
 
 
@@ -2876,7 +2976,7 @@ async def latency_breakdown(
 
     Args:
         campaign_id: Restrict to a campaign (comma-separated for several).
-        agent_config_id: Restrict to an agent config.
+        agent_config_id: Restrict to an agent config (comma-separated for several).
         prompt_ref: Restrict to a prompt reference ID.
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
@@ -2891,6 +2991,15 @@ async def latency_breakdown(
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
     data = await _get(ctx, "/observability/breakdown", params=params)
+    data = await _note_unmatched(
+        ctx,
+        data,
+        not data.get("breakdown"),
+        {"campaign_id": campaign_id, "agent_config_id": agent_config_id, "prompt_ref": prompt_ref},
+        time_range_minutes,
+        time_from,
+        time_to,
+    )
     return _out({"retention": _RETENTION["spans"], **data})
 
 
@@ -2925,7 +3034,7 @@ async def event_counts_over_time(
         event_types: Comma-separated event names to restrict to (e.g. "pipeline.voicemail,tool.completed"). Empty returns all, summarized to totals past the row budget above.
         granularity: "5min", "15min", "1hour" (default), or "10min" / "30min" / "1day" (UTC days), which sum 5min / 15min / 1hour buckets client-side — exact for count, an upper bound for calls; see the response's NOTE.
         campaign_id: Restrict to a campaign.
-        agent_config_id: Restrict to an agent config.
+        agent_config_id: Restrict to an agent config (comma-separated for several).
         time_range_minutes: Look back N minutes (default 360, max 43200 = 30 days).
         time_from: ISO8601 start (alternative to time_range_minutes).
         time_to: ISO8601 end.
@@ -2951,6 +3060,15 @@ async def event_counts_over_time(
             ("count", "calls"),
             caveat=_upper_bound_caveat("calls", granularity),
         )
+    data = await _note_unmatched(
+        ctx,
+        data,
+        not data.get("series") and not data.get("totals"),
+        {"campaign_id": campaign_id, "agent_config_id": agent_config_id},
+        time_range_minutes,
+        time_from,
+        time_to,
+    )
     return _out({"retention": _RETENTION["mv"], **data})
 
 
@@ -3011,6 +3129,15 @@ async def error_counts_over_time(
             caveat=_upper_bound_caveat("affected_calls", granularity),
             widened=widened,
         )
+    data = await _note_unmatched(
+        ctx,
+        data,
+        not data.get("series") and not data.get("totals"),
+        {"campaign_id": campaign_id, "prompt_ref": prompt_ref},
+        time_range_minutes,
+        time_from,
+        time_to,
+    )
     return _out({"retention": _RETENTION["mv"], **data})
 
 
@@ -3042,7 +3169,18 @@ async def tool_outcomes(
     if prompt_ref:
         params["prompt_ref"] = prompt_ref
     _window(params, time_range_minutes, time_from, time_to)
-    return _out(await _get(ctx, "/observability/tools", params=params))
+    data = await _get(ctx, "/observability/tools", params=params)
+    return _out(
+        await _note_unmatched(
+            ctx,
+            data,
+            not data.get("tools"),
+            {"campaign_id": campaign_id, "prompt_ref": prompt_ref},
+            time_range_minutes,
+            time_from,
+            time_to,
+        )
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -3092,7 +3230,7 @@ async def slowest_calls(
         event_name: Exact event_name filter (e.g. "llm.usage").
         metric: "value_ms" (default) or "metadata:<key>" for a numeric metadata field.
         campaign_id: Restrict to a campaign (comma-separated for several).
-        agent_config_id: Restrict to an agent config.
+        agent_config_id: Restrict to an agent config (comma-separated for several).
         prompt_ref: Restrict to a prompt reference ID.
         percentiles: Comma-separated percentiles (default "50,90").
         order_by: Rank by this — a percentile like "p90", or avg/max/min/sum/count.
@@ -3137,6 +3275,15 @@ async def slowest_calls(
         "/observability/call-percentiles",
         params,
         needs="squadrun/lens#56 (use aggregate_calls meanwhile)",
+    )
+    data = await _note_unmatched(
+        ctx,
+        data,
+        not data.get("calls"),
+        {"campaign_id": campaign_id, "agent_config_id": agent_config_id, "prompt_ref": prompt_ref},
+        time_range_minutes,
+        time_from,
+        time_to,
     )
     return _out({"retention": _RETENTION["spans"], **data})
 

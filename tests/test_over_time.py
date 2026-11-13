@@ -181,6 +181,8 @@ class NodeSeries:
         self.requests = []
 
     async def get(self, ctx, path, params=None):
+        if path == "/search/count":  # the unmatched-filter check on an empty series
+            return {"total_spans": 1}
         params = dict(params or {})
         self.requests.append(params)
         if params.get("campaign_id") != "7":
